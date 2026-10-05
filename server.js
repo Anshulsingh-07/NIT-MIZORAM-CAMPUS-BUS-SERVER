@@ -105,6 +105,7 @@ function publicUser(row) {
         email: row.email,
         role: row.role,
         hostelId: row.hostel_id,
+        mustChangePassword: Boolean(row.must_change_password),
     };
 }
 
@@ -213,6 +214,11 @@ function requireAuth(req, res, allowedRoles = null) {
         return null;
     }
 
+    if (session.mustChangePassword && !['/api/auth/change-password', '/api/auth/logout'].includes(req.path)) {
+        res.status(403).json({ error: 'Change your temporary password to continue' });
+        return null;
+    }
+
     return { token, ...session };
 }
 
@@ -224,6 +230,7 @@ function createToken(user) {
         email: user.email,
         role: user.role,
         hostelId: user.hostel_id,
+        mustChangePassword: Boolean(user.must_change_password),
         phone: user.phone,
         busNumber: user.bus_number,
         expiresAt,
@@ -325,10 +332,12 @@ CREATE TABLE IF NOT EXISTS users (
   password VARCHAR(120) NOT NULL,
   role VARCHAR(20) NOT NULL,
   hostel_id VARCHAR(10) NULL,
+    must_change_password BOOLEAN NOT NULL DEFAULT false,
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   FOREIGN KEY (hostel_id) REFERENCES hostels(id) ON DELETE SET NULL
 );
 `);
+    await q('ALTER TABLE users ADD COLUMN IF NOT EXISTS must_change_password BOOLEAN NOT NULL DEFAULT false');
 
     await q(`
 CREATE TABLE IF NOT EXISTS buses (
@@ -757,17 +766,47 @@ app.get('/api/telemetry/history', async (req, res) => {
 
 app.post('/api/auth/login', async (req, res) => {
     try {
-        const { email, password } = req.body || {};
-        const rows = await q('SELECT id, name, email, role, hostel_id, password FROM users WHERE email = ? LIMIT 1', [email || '']);
-        if (rows.length === 0 || rows[0].password !== password) {
+        const email = String(req.body?.email || '').trim().toLowerCase();
+        const password = String(req.body?.password || '');
+        const rows = await q('SELECT id, name, email, role, hostel_id, password, must_change_password FROM users WHERE LOWER(email) = LOWER(?) LIMIT 1', [email]);
+        const storedPassword = String(rows[0]?.password || '');
+        const isBcryptHash = /^\$2[aby]\$/.test(storedPassword);
+        const passwordMatches = rows.length > 0 && (
+            isBcryptHash
+                ? await bcrypt.compare(password, storedPassword)
+                : storedPassword === password
+        );
+        if (!passwordMatches) {
             return res.status(401).json({ error: 'Invalid credentials' });
         }
 
         const user = rows[0];
+        if (!isBcryptHash) {
+            const passwordHash = await bcrypt.hash(password, 12);
+            await q('UPDATE users SET password = ? WHERE id = ?', [passwordHash, user.id]);
+        }
         const token = createToken(user);
         return res.json({ token, user: publicUser(user) });
     } catch (error) {
         return res.status(500).json({ error: error.message });
+    }
+});
+
+app.post('/api/auth/change-password', async (req, res) => {
+    const auth = requireAuth(req, res);
+    if (!auth) return;
+    const newPassword = String(req.body?.newPassword || '');
+    if (newPassword.length < 8 || newPassword.length > 128) {
+        return res.status(400).json({ error: 'Choose a password between 8 and 128 characters' });
+    }
+    try {
+        const passwordHash = await bcrypt.hash(newPassword, 12);
+        await q('UPDATE users SET password = ?, must_change_password = false WHERE id = ?', [passwordHash, auth.userId]);
+        const session = sessions.get(auth.token);
+        if (session) session.mustChangePassword = false;
+        return res.json({ status: 'success', message: 'Password updated' });
+    } catch (error) {
+        return res.status(500).json({ error: 'Could not update password' });
     }
 });
 
