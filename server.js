@@ -476,12 +476,13 @@ app.get('/', (_req, res) => {
 
 app.get('/api/health', async (_req, res) => {
     try {
-        const [[hostels], [buses], [notifications]] = await Promise.all([
+        const [[hostels], [buses], [notifications], [caretakers]] = await Promise.all([
             q('SELECT COUNT(*) AS count FROM hostels'),
             q('SELECT COUNT(*) AS count FROM buses'),
             q('SELECT COUNT(*) AS count FROM notifications'),
+            q("SELECT COUNT(*) AS count FROM users WHERE LOWER(role) = 'caretaker' AND password LIKE '$2%'"),
         ]);
-        res.json({ status: 'ok', hostels: hostels.count, buses: buses.count, notifications: notifications.count });
+        res.json({ status: 'ok', authVersion: 'bcrypt-v1', hostels: hostels.count, buses: buses.count, notifications: notifications.count, bcryptCaretakers: caretakers.count });
     } catch (error) {
         res.status(500).json({ status: 'error', message: error.message });
     }
