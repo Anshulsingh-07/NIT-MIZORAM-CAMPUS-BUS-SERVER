@@ -18,6 +18,9 @@ CREATE TABLE IF NOT EXISTS users (
   FOREIGN KEY (hostel_id) REFERENCES hostels(id) ON DELETE SET NULL
 );
 
+ALTER TABLE users ADD COLUMN IF NOT EXISTS must_change_password BOOLEAN NOT NULL DEFAULT false;
+CREATE UNIQUE INDEX IF NOT EXISTS users_email_lower_unique ON users (LOWER(email));
+
 CREATE TABLE IF NOT EXISTS buses (
   bus_number INT PRIMARY KEY,
   assigned_hostel VARCHAR(10) NOT NULL,
@@ -66,10 +69,29 @@ CREATE TABLE IF NOT EXISTS notifications (
   bus_number INT NULL,
   target_hostel VARCHAR(10) NULL,
   sent_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  expires_at TIMESTAMP NOT NULL DEFAULT (CURRENT_TIMESTAMP + INTERVAL '30 days'),
   is_read BOOLEAN NOT NULL DEFAULT false,
   sent_by VARCHAR(120) NULL,
   FOREIGN KEY (target_hostel) REFERENCES hostels(id) ON DELETE SET NULL
 );
+
+CREATE TABLE IF NOT EXISTS reports (
+  id VARCHAR(40) PRIMARY KEY,
+  reporter_id VARCHAR(40) NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  hostel_id VARCHAR(10) NOT NULL REFERENCES hostels(id),
+  bus_number INT NULL REFERENCES buses(bus_number) ON DELETE SET NULL,
+  category VARCHAR(40) NOT NULL,
+  message TEXT NOT NULL,
+  status VARCHAR(20) NOT NULL DEFAULT 'open',
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS reports_hostel_created_idx ON reports (hostel_id, created_at DESC);
+
+ALTER TABLE notifications ADD COLUMN IF NOT EXISTS expires_at TIMESTAMP;
+UPDATE notifications SET expires_at = sent_at + INTERVAL '30 days' WHERE expires_at IS NULL;
+ALTER TABLE notifications ALTER COLUMN expires_at SET DEFAULT (CURRENT_TIMESTAMP + INTERVAL '30 days');
+ALTER TABLE notifications ALTER COLUMN expires_at SET NOT NULL;
+CREATE INDEX IF NOT EXISTS notifications_expires_at_idx ON notifications (expires_at);
 
 CREATE TABLE IF NOT EXISTS telemetry (
   id SERIAL PRIMARY KEY,
