@@ -3,6 +3,7 @@ const crypto = require('crypto');
 const EventEmitter = require('events');
 const bcrypt = require('bcryptjs');
 const { Pool } = require('pg');
+const { campusDateKey, isDateOnly } = require('./campus_time');
 require('dotenv').config();
 
 if (process.env.NODE_ENV === 'production' && !process.env.API_SECRET_KEY) {
@@ -77,7 +78,8 @@ const sessions = new Map();
 const driverLoginFailures = new Map();
 const driverLastFixes = new Map();
 
-const today = () => new Date().toISOString().slice(0, 10);
+// Schedule calendar dates belong to the campus, whose civil timezone is IST.
+const today = () => campusDateKey(new Date());
 const uid = (prefix) => `${prefix}${crypto.randomBytes(6).toString('hex')}`;
 // Student roll IDs use the published example shape BT24CS034. The configured
 // account table currently contains caretaker identities only; see SECURITY_NOTES.md.
@@ -400,6 +402,34 @@ CREATE TABLE IF NOT EXISTS drivers (
     await q('ALTER TABLE drivers ADD COLUMN IF NOT EXISTS pin_hash VARCHAR(100) NULL');
     await q('DROP INDEX IF EXISTS drivers_active_phone_unique');
     await q(`
+CREATE TABLE IF NOT EXISTS schedules (
+  id VARCHAR(40) PRIMARY KEY,
+  bus_number INT NOT NULL REFERENCES buses(bus_number) ON DELETE CASCADE,
+  date DATE NOT NULL,
+  from_hostel_time VARCHAR(20) NOT NULL,
+  from_mbse_time VARCHAR(20) NOT NULL,
+  special_note VARCHAR(255) NULL,
+  updated_by VARCHAR(120) NULL,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE (bus_number, date)
+);
+`);
+    const scheduleDateType = await q(`SELECT data_type FROM information_schema.columns
+        WHERE table_schema = current_schema() AND table_name = 'schedules' AND column_name = 'date'`);
+    if (scheduleDateType.length && scheduleDateType[0].data_type !== 'date') {
+        // Legacy timestamp values are converted to their IST calendar date. A UTC-midnight
+        // value and an IST-midnight instant therefore both retain the intended civil day.
+        const dateExpression = scheduleDateType[0].data_type === 'timestamp with time zone'
+            ? `(date AT TIME ZONE 'Asia/Kolkata')::date`
+            : 'date::date';
+        const collisions = await q(`SELECT bus_number, ${dateExpression} AS normalized_date
+            FROM schedules GROUP BY bus_number, ${dateExpression} HAVING COUNT(*) > 1 LIMIT 1`);
+        if (collisions.length) {
+            throw new Error('Schedule date migration found multiple records for one bus and IST date; resolve these rows before converting the legacy timestamp column');
+        }
+        await q(`ALTER TABLE schedules ALTER COLUMN date TYPE DATE USING ${dateExpression}`);
+    }
+    await q(`
 CREATE TABLE IF NOT EXISTS notifications (
   id VARCHAR(40) PRIMARY KEY,
   title VARCHAR(160) NOT NULL,
@@ -508,12 +538,22 @@ app.get('/api', (_req, res) => {
 
 app.get('/api/health', async (_req, res) => {
     try {
+        const serverTimeZone = Intl.DateTimeFormat().resolvedOptions().timeZone || 'unknown';
+        const serverTimeUtc = new Date().toISOString();
         const [[hostels], [buses], [notifications]] = await Promise.all([
             q('SELECT COUNT(*) AS count FROM hostels'),
             q('SELECT COUNT(*) AS count FROM buses'),
             q('SELECT COUNT(*) AS count FROM notifications'),
         ]);
-        res.json({ status: 'ok', hostels: hostels.count, buses: buses.count, notifications: notifications.count });
+        res.json({
+            status: 'ok',
+            hostels: hostels.count,
+            buses: buses.count,
+            notifications: notifications.count,
+            serverTimeZone,
+            serverTimeUtc,
+            campusDate: today(),
+        });
     } catch (error) {
         console.error('Health database query failed:', error.message);
         res.status(500).json({ status: 'error', message: 'Database query failed' });
@@ -971,7 +1011,7 @@ app.get('/api/today-buses', async (req, res) => {
     const auth = requireAuth(req, res, ['student', 'caretaker', 'admin', 'driver']);
     if (!auth) return;
     const date = String(req.query.date || today());
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+    if (!isDateOnly(date)) {
         return res.status(400).json({ error: 'date must use YYYY-MM-DD format' });
     }
     try {
@@ -1130,6 +1170,9 @@ app.get('/api/schedules', async (req, res) => {
         if (auth.role === 'caretaker' && !auth.hostelId) return res.status(403).json({ error: 'Caretaker account has no assigned hostel' });
         const hostel = auth.role === 'caretaker' ? auth.hostelId : (req.query.hostel || null);
         const date = req.query.date || null;
+        if (date !== null && !isDateOnly(String(date))) {
+            return res.status(400).json({ error: 'date must be a valid YYYY-MM-DD campus date' });
+        }
 
         const rows = await q(
             `
@@ -1172,6 +1215,9 @@ app.post('/api/schedules', async (req, res) => {
         }
 
         const scheduleDate = req.body.date || today();
+        if (!isDateOnly(scheduleDate)) {
+            return res.status(400).json({ error: 'date must be a valid YYYY-MM-DD campus date' });
+        }
         const fromHostelTime = req.body.fromHostelTime || '';
         const fromMBSETime = req.body.fromMBSETime || '';
         const specialNote = req.body.specialNote || '';

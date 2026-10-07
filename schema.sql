@@ -61,6 +61,32 @@ CREATE TABLE IF NOT EXISTS schedules (
   FOREIGN KEY (bus_number) REFERENCES buses(bus_number) ON DELETE CASCADE
 );
 
+-- Schedule dates are campus calendar dates (IST) stored as SQL DATE, never timestamps.
+-- If an older deployment used timestamp columns, convert instants to their IST day.
+DO $$
+DECLARE
+  stored_type TEXT;
+  date_expression TEXT;
+  has_collisions BOOLEAN;
+BEGIN
+  SELECT data_type INTO stored_type
+  FROM information_schema.columns
+  WHERE table_schema = current_schema() AND table_name = 'schedules' AND column_name = 'date';
+  IF stored_type IS NOT NULL AND stored_type <> 'date' THEN
+    IF stored_type = 'timestamp with time zone' THEN
+      date_expression := '(date AT TIME ZONE ''Asia/Kolkata'')::date';
+    ELSE
+      date_expression := 'date::date';
+    END IF;
+    EXECUTE format('SELECT EXISTS (SELECT 1 FROM schedules GROUP BY bus_number, %s HAVING COUNT(*) > 1)', date_expression)
+      INTO has_collisions;
+    IF has_collisions THEN
+      RAISE EXCEPTION 'schedules date migration found duplicate records for one bus and IST date';
+    END IF;
+    EXECUTE format('ALTER TABLE schedules ALTER COLUMN date TYPE DATE USING %s', date_expression);
+  END IF;
+END $$;
+
 CREATE TABLE IF NOT EXISTS notifications (
   id VARCHAR(40) PRIMARY KEY,
   title VARCHAR(160) NOT NULL,
