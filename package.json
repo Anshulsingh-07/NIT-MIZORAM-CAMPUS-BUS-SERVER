@@ -1,22 +1,17 @@
 {
-  "name": "my_server",
+  "name": "nit-mizoram-campus-bus-server",
   "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
+  "private": true,
+  "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "esp32:random": "python3 esp32_random_sender.py --target-host 127.0.0.1 --port 5000",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "node --test"
   },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
   "type": "commonjs",
   "dependencies": {
-    "bcrypt": "^6.0.0",
+    "bcryptjs": "^3.0.3",
     "dotenv": "^17.4.2",
     "express": "^5.2.1",
-    "mysql2": "^3.15.2",
     "pg": "^8.23.0"
   }
 }
