@@ -34,8 +34,6 @@ let pool;
 const hostelsSeed = [
     { id: 'GH1', name: 'GH1', type: 'Girls', fullName: "Girls' Hostel 1" },
     { id: 'GH2', name: 'GH2', type: 'Girls', fullName: "Girls' Hostel 2" },
-    { id: 'GH3', name: 'GH3', type: 'Girls', fullName: "Girls' Hostel 3" },
-    { id: 'GH4', name: 'GH4', type: 'Girls', fullName: "Girls' Hostel 4" },
     { id: 'BH1', name: 'BH1', type: 'Boys', fullName: "Boys' Hostel 1" },
     { id: 'BH2', name: 'BH2', type: 'Boys', fullName: "Boys' Hostel 2" },
     { id: 'BH3', name: 'BH3', type: 'Boys', fullName: "Boys' Hostel 3" },
@@ -358,6 +356,7 @@ CREATE TABLE IF NOT EXISTS users (
 );
 `);
     await q('ALTER TABLE users ADD COLUMN IF NOT EXISTS must_change_password BOOLEAN NOT NULL DEFAULT false');
+    await q('CREATE TABLE IF NOT EXISTS app_migrations (id VARCHAR(120) PRIMARY KEY, applied_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP)');
     const duplicateEmails = await q('SELECT LOWER(email) AS email FROM users GROUP BY LOWER(email) HAVING COUNT(*) > 1');
     if (duplicateEmails.length) {
         throw new Error('Duplicate email accounts must be resolved before the server can start');
@@ -493,6 +492,33 @@ CREATE TABLE IF NOT EXISTS telemetry (
         ]);
     }
 
+    const caretakerMigrationId = 'caretaker-passwords-from-email-v1';
+    const [caretakerMigration] = await q('SELECT id FROM app_migrations WHERE id = ?', [caretakerMigrationId]);
+    if (!caretakerMigration) {
+        for (const hostel of hostelsSeed) {
+            const email = `caretaker-${hostel.id.toLowerCase()}@nitmz.ac.in`;
+            const password = email.split('@')[0].replace(/-/g, '_');
+            const passwordHash = await bcrypt.hash(password, 12);
+            const provisioned = await q(
+                `INSERT INTO users (id, name, email, password, role, hostel_id, must_change_password)
+                 VALUES (?, ?, ?, ?, 'caretaker', ?, true)
+                 ON CONFLICT (email) DO UPDATE SET
+                   name = EXCLUDED.name,
+                   password = EXCLUDED.password,
+                   role = 'caretaker',
+                   hostel_id = EXCLUDED.hostel_id,
+                   must_change_password = true
+                 WHERE users.role = 'caretaker'
+                 RETURNING id`,
+                [uid('usr_'), `${hostel.fullName} Caretaker`, email, passwordHash, hostel.id]
+            );
+            if (!provisioned.length) {
+                throw new Error(`Caretaker email is already assigned to a non-caretaker account: ${email}`);
+            }
+        }
+        await q('INSERT INTO app_migrations (id) VALUES (?) ON CONFLICT (id) DO NOTHING', [caretakerMigrationId]);
+    }
+
     const [busCountRow] = await q('SELECT COUNT(*) AS count FROM buses');
     const busCount = busCountRow ? Number(busCountRow.count) : 0;
     if (busCount === 0) {
@@ -562,7 +588,8 @@ app.get('/api/health', async (_req, res) => {
 
 app.get('/api/hostels', async (_req, res) => {
     try {
-        const rows = await q('SELECT id, name, type, full_name AS fullName FROM hostels ORDER BY id');
+        const allowedHostels = hostelsSeed.map((hostel) => hostel.id);
+        const rows = await q('SELECT id, name, type, full_name AS fullName FROM hostels WHERE id = ANY(?::varchar[]) ORDER BY id', [allowedHostels]);
         res.json({ status: 'success', data: rows });
     } catch (error) {
         res.status(500).json({ error: error.message });
@@ -586,6 +613,9 @@ app.post('/api/auth/register', async (req, res) => {
             return res.status(400).json({ error: 'Name must contain 1 to 100 characters' });
         }
         const selectedHostel = String(hostelId || '').trim().toUpperCase();
+        if (!hostelsSeed.some((hostel) => hostel.id === selectedHostel)) {
+            return res.status(400).json({ error: 'Select a valid hostel' });
+        }
         const validHostel = await q('SELECT id FROM hostels WHERE id = ? LIMIT 1', [selectedHostel]);
         if (!validHostel.length) return res.status(400).json({ error: 'Select a valid hostel' });
 
@@ -903,6 +933,9 @@ app.post('/api/auth/login', async (req, res) => {
         }
 
         const user = rows[0];
+        if (user.role === 'caretaker' && !hostelsSeed.some((hostel) => hostel.id === user.hostel_id)) {
+            return res.status(401).json({ error: 'Invalid credentials' });
+        }
         const token = createToken(user);
         return res.json({ token, user: publicUser(user), mustChangePassword: Boolean(user.must_change_password) });
     } catch (error) {
