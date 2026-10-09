@@ -25,3 +25,15 @@ services:
         value: postgres
       - key: DB_SSL
         value: true
+      - key: CARETAKER_INITIAL_PASSWORD
+        sync: false
+      - key: CARETAKER_RECOVERY_EMAILS
+        sync: false
+      - key: MAIL_FROM
+        sync: false
+      - key: BREVO_API_KEY
+        sync: false
+      - key: RESEND_API_KEY
+        sync: false
+      - key: PUBLIC_BASE_URL
+        sync: false

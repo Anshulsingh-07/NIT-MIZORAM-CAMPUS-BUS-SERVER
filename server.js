@@ -4,6 +4,7 @@ const EventEmitter = require('events');
 const bcrypt = require('bcryptjs');
 const { Pool } = require('pg');
 const { campusDateKey, isDateOnly, matchesCampusDate } = require('./campus_time');
+const { mailProvider, sendMail } = require('./mailer');
 require('dotenv').config();
 
 if (process.env.NODE_ENV === 'production' && !process.env.API_SECRET_KEY) {
@@ -18,6 +19,7 @@ if (process.env.NODE_ENV === 'production' && !process.env.DATABASE_URL) {
 }
 
 const app = express();
+if (process.env.NODE_ENV === 'production') app.set('trust proxy', 1);
 const telemetryEmitter = new EventEmitter();
 telemetryEmitter.setMaxListeners(0);
 const port = Number(process.env.PORT || 8080);
@@ -34,8 +36,6 @@ let pool;
 const hostelsSeed = [
     { id: 'GH1', name: 'GH1', type: 'Girls', fullName: "Girls' Hostel 1" },
     { id: 'GH2', name: 'GH2', type: 'Girls', fullName: "Girls' Hostel 2" },
-    { id: 'GH3', name: 'GH3', type: 'Girls', fullName: "Girls' Hostel 3" },
-    { id: 'GH4', name: 'GH4', type: 'Girls', fullName: "Girls' Hostel 4" },
     { id: 'BH1', name: 'BH1', type: 'Boys', fullName: "Boys' Hostel 1" },
     { id: 'BH2', name: 'BH2', type: 'Boys', fullName: "Boys' Hostel 2" },
     { id: 'BH3', name: 'BH3', type: 'Boys', fullName: "Boys' Hostel 3" },
@@ -77,6 +77,9 @@ const notificationsSeed = [
 const sessions = new Map();
 const driverLoginFailures = new Map();
 const driverLastFixes = new Map();
+const forgotPasswordEmailLimits = new Map();
+const forgotPasswordIpLimits = new Map();
+const resetPasswordIpLimits = new Map();
 
 // Schedule calendar dates belong to the campus, whose civil timezone is IST.
 const today = () => campusDateKey(new Date());
@@ -108,6 +111,87 @@ async function q(sql, params = []) {
     const text = sql.replace(/\?/g, () => `$${++idx}`);
     const res = await pool.query(text, params);
     return res.rows;
+}
+
+function consumeSlidingWindowLimit(limits, key, limit, windowMs, now = Date.now()) {
+    for (const [entryKey, timestamps] of limits) {
+        const recent = timestamps.filter((timestamp) => now - timestamp < windowMs);
+        if (recent.length) limits.set(entryKey, recent);
+        else limits.delete(entryKey);
+    }
+    const timestamps = limits.get(key) || [];
+    if (timestamps.length >= limit) return false;
+    timestamps.push(now);
+    limits.set(key, timestamps);
+    return true;
+}
+
+async function ensureCaretakerAccounts() {
+    const initialPassword = process.env.CARETAKER_INITIAL_PASSWORD || '';
+    const validInitialPassword = initialPassword.length >= 9 && initialPassword.length <= 128;
+    if (initialPassword && !validInitialPassword) {
+        console.warn('CARETAKER_INITIAL_PASSWORD must be 9 to 128 characters; caretaker password bootstrap skipped');
+    }
+
+    const recoveryEmails = new Map();
+    for (const entry of (process.env.CARETAKER_RECOVERY_EMAILS || '').split(',')) {
+        if (!entry.trim()) continue;
+        const separator = entry.indexOf(':');
+        if (separator < 1) {
+            console.warn(`Ignoring invalid CARETAKER_RECOVERY_EMAILS entry: ${entry.trim()}`);
+            continue;
+        }
+        const hostelId = entry.slice(0, separator).trim().toUpperCase();
+        const email = entry.slice(separator + 1).trim().toLowerCase();
+        if (!hostelsSeed.some((hostel) => hostel.id === hostelId) || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+            console.warn(`Ignoring invalid CARETAKER_RECOVERY_EMAILS entry: ${entry.trim()}`);
+            continue;
+        }
+        recoveryEmails.set(hostelId, email);
+    }
+
+    for (const hostel of hostelsSeed) {
+        const email = `caretaker-${hostel.id.toLowerCase()}@nitmz.ac.in`;
+        const recoveryEmail = recoveryEmails.get(hostel.id) || null;
+        const accounts = await q('SELECT id, role, password FROM users WHERE LOWER(email) = LOWER(?) LIMIT 1', [email]);
+        const account = accounts[0];
+
+        if (!account) {
+            if (!validInitialPassword) {
+                console.warn(`Caretaker account ${email} was not created; configure CARETAKER_INITIAL_PASSWORD (9-128 characters)`);
+                continue;
+            }
+            await q(
+                `INSERT INTO users (id, name, email, password, role, hostel_id, recovery_email, must_change_password)
+                 VALUES (?, ?, ?, ?, 'caretaker', ?, ?, true)`,
+                [uid('usr_'), `${hostel.id} Caretaker`, email, await bcrypt.hash(initialPassword, 12), hostel.id, recoveryEmail]
+            );
+            continue;
+        }
+
+        if (account.role !== 'caretaker') {
+            console.warn(`Caretaker account ${email} conflicts with an existing non-caretaker account; skipping bootstrap`);
+            continue;
+        }
+
+        const isBcryptHash = /^\$2[aby]\$/.test(account.password || '');
+        if (!isBcryptHash && validInitialPassword) {
+            await q(
+                `UPDATE users SET name = ?, password = ?, role = 'caretaker', hostel_id = ?,
+                 recovery_email = COALESCE(?, recovery_email), must_change_password = true WHERE id = ?`,
+                [`${hostel.id} Caretaker`, await bcrypt.hash(initialPassword, 12), hostel.id, recoveryEmail, account.id]
+            );
+        } else {
+            if (!isBcryptHash) {
+                console.warn(`Legacy password for ${email} was not migrated; configure a valid CARETAKER_INITIAL_PASSWORD`);
+            }
+            await q(
+                `UPDATE users SET name = ?, role = 'caretaker', hostel_id = ?,
+                 recovery_email = COALESCE(?, recovery_email) WHERE id = ?`,
+                [`${hostel.id} Caretaker`, hostel.id, recoveryEmail, account.id]
+            );
+        }
+    }
 }
 
 function publicUser(row) {
@@ -370,6 +454,17 @@ CREATE TABLE IF NOT EXISTS users (
 );
 `);
     await q('ALTER TABLE users ADD COLUMN IF NOT EXISTS must_change_password BOOLEAN NOT NULL DEFAULT false');
+        await q('ALTER TABLE users ADD COLUMN IF NOT EXISTS recovery_email VARCHAR(120) NULL');
+        await q(`
+CREATE TABLE IF NOT EXISTS password_resets (
+    id SERIAL PRIMARY KEY,
+    user_id VARCHAR(40) NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    token_hash CHAR(64) NOT NULL UNIQUE,
+    expires_at TIMESTAMPTZ NOT NULL,
+    used_at TIMESTAMPTZ NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+`);
     const duplicateEmails = await q('SELECT LOWER(email) AS email FROM users GROUP BY LOWER(email) HAVING COUNT(*) > 1');
     if (duplicateEmails.length) {
         throw new Error('Duplicate email accounts must be resolved before the server can start');
@@ -504,6 +599,7 @@ CREATE TABLE IF NOT EXISTS telemetry (
             hostel.fullName,
         ]);
     }
+    await ensureCaretakerAccounts();
 
     const [busCountRow] = await q('SELECT COUNT(*) AS count FROM buses');
     const busCount = busCountRow ? Number(busCountRow.count) : 0;
@@ -574,7 +670,8 @@ app.get('/api/health', async (_req, res) => {
 
 app.get('/api/hostels', async (_req, res) => {
     try {
-        const rows = await q('SELECT id, name, type, full_name AS fullName FROM hostels ORDER BY id');
+        const allowedHostels = hostelsSeed.map((hostel) => hostel.id);
+        const rows = await q('SELECT id, name, type, full_name AS fullName FROM hostels WHERE id = ANY(?::varchar[]) ORDER BY id', [allowedHostels]);
         res.json({ status: 'success', data: rows });
     } catch (error) {
         res.status(500).json({ error: error.message });
@@ -598,6 +695,9 @@ app.post('/api/auth/register', async (req, res) => {
             return res.status(400).json({ error: 'Name must contain 1 to 100 characters' });
         }
         const selectedHostel = String(hostelId || '').trim().toUpperCase();
+        if (!hostelsSeed.some((hostel) => hostel.id === selectedHostel)) {
+            return res.status(400).json({ error: 'Select a valid hostel' });
+        }
         const validHostel = await q('SELECT id FROM hostels WHERE id = ? LIMIT 1', [selectedHostel]);
         if (!validHostel.length) return res.status(400).json({ error: 'Select a valid hostel' });
 
@@ -877,10 +977,173 @@ app.get('/api/telemetry/history', async (req, res) => {
     }
 });
 
-app.post('/api/auth/forgot-password', (_req, res) => {
-    return res.status(503).json({
-        error: 'Password reset is unavailable until verified email delivery is configured. Contact an administrator.',
+app.get('/reset-password', (_req, res) => {
+    res.set({
+        'Content-Security-Policy': "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'; form-action 'self'; base-uri 'none'",
+        'Referrer-Policy': 'no-referrer',
+        'Cache-Control': 'no-store',
     });
+    return res.type('html').send(`<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Reset password</title>
+  <style>
+    body { font: 16px system-ui, sans-serif; margin: 0; min-height: 100vh; display: grid; place-items: center; background: #eef3f8; color: #18212b; }
+    main { width: min(420px, calc(100% - 40px)); padding: 28px; background: white; border: 1px solid #d5dde6; border-radius: 12px; box-sizing: border-box; }
+    h1 { margin-top: 0; font-size: 24px; }
+    label { display: block; margin: 16px 0 6px; }
+    input, button { width: 100%; box-sizing: border-box; padding: 12px; font: inherit; }
+    input { border: 1px solid #8a98a8; border-radius: 6px; }
+    button { margin-top: 20px; color: white; background: #1769aa; border: 0; border-radius: 6px; cursor: pointer; }
+    #message { min-height: 24px; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Choose a new password</h1>
+    <form id="reset-form">
+      <label for="password">New password</label>
+      <input id="password" type="password" minlength="9" maxlength="128" autocomplete="new-password" required>
+      <label for="confirm">Confirm new password</label>
+      <input id="confirm" type="password" minlength="9" maxlength="128" autocomplete="new-password" required>
+      <button type="submit">Update password</button>
+    </form>
+    <p id="message" role="status"></p>
+  </main>
+  <script>
+    const tokenMatch = location.hash.match(/^#token=([a-f0-9]{64})$/i);
+    const token = tokenMatch ? tokenMatch[1] : '';
+    history.replaceState(null, '', location.pathname + location.search);
+    const form = document.getElementById('reset-form');
+    const message = document.getElementById('message');
+    if (!token) {
+      form.hidden = true;
+      message.textContent = 'This password reset link is invalid or incomplete.';
+    }
+    form.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      const password = document.getElementById('password').value;
+      const confirmation = document.getElementById('confirm').value;
+      if (password !== confirmation) {
+        message.textContent = 'The passwords do not match.';
+        return;
+      }
+      message.textContent = 'Updating password...';
+      try {
+        const response = await fetch('/api/auth/reset-password', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ token, newPassword: password })
+        });
+        const result = await response.json();
+        message.textContent = response.ok ? result.message : (result.error || 'Could not reset password.');
+        if (response.ok) form.hidden = true;
+      } catch (_) {
+        message.textContent = 'Could not reach the server. Try again.';
+      }
+    });
+  </script>
+</body>
+</html>`);
+});
+
+app.post('/api/auth/forgot-password', (req, res) => {
+    const email = String(req.body?.email || '').trim().toLowerCase();
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+        return res.status(400).json({ error: 'Enter a valid email address' });
+    }
+
+    const ip = req.ip || req.socket.remoteAddress || 'unknown';
+    const withinEmailLimit = consumeSlidingWindowLimit(forgotPasswordEmailLimits, email, 3, 15 * 60 * 1000);
+    const withinIpLimit = consumeSlidingWindowLimit(forgotPasswordIpLimits, ip, 10, 60 * 60 * 1000);
+    if (!withinEmailLimit || !withinIpLimit) {
+        return res.status(429).json({ error: 'Too many password reset requests. Try again later.' });
+    }
+
+    if (process.env.NODE_ENV === 'production' && !mailProvider(process.env)) {
+        return res.status(503).json({
+            error: 'Password reset is unavailable until verified email delivery is configured. Contact an administrator.',
+        });
+    }
+
+    res.once('finish', () => {
+        setImmediate(() => {
+            void (async () => {
+                const users = await q('SELECT id, email, recovery_email FROM users WHERE LOWER(email) = LOWER(?) LIMIT 1', [email]);
+                const user = users[0];
+                if (!user) return;
+
+                const token = crypto.randomBytes(32).toString('hex');
+                const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
+                await q('DELETE FROM password_resets WHERE user_id = ? AND used_at IS NULL', [user.id]);
+                await q("INSERT INTO password_resets (user_id, token_hash, expires_at) VALUES (?, ?, NOW() + INTERVAL '30 minutes')", [user.id, tokenHash]);
+
+                const configuredBaseUrl = process.env.PUBLIC_BASE_URL || process.env.RENDER_EXTERNAL_URL;
+                const baseUrl = (configuredBaseUrl || `http://localhost:${port}`).replace(/\/+$/, '');
+                const resetUrl = `${baseUrl}/reset-password#token=${token}`;
+                const mail = {
+                    to: user.recovery_email || user.email,
+                    subject: 'Campus Bus Tracker password reset',
+                    text: `Use this link to reset your password. It expires in 30 minutes:\n${resetUrl}`,
+                    html: `<p>Use this link to reset your password. It expires in 30 minutes:</p><p><a href="${resetUrl}">Reset password</a></p>`,
+                };
+                if (mailProvider(process.env)) {
+                    await sendMail(mail);
+                } else {
+                    console.info(`Development password reset link for ${email}: ${resetUrl}`);
+                }
+            })().catch((error) => console.error('Password reset request could not be processed:', error.message));
+        });
+    });
+    return res.status(200).json({ message: 'If an account exists for this email, password reset instructions will be sent.' });
+});
+
+app.post('/api/auth/reset-password', async (req, res) => {
+    const ip = req.ip || req.socket.remoteAddress || 'unknown';
+    if (!consumeSlidingWindowLimit(resetPasswordIpLimits, ip, 20, 15 * 60 * 1000)) {
+        return res.status(429).json({ error: 'Too many password reset attempts. Try again later.' });
+    }
+
+    const token = String(req.body?.token || '');
+    const newPassword = String(req.body?.newPassword || '');
+    if (!/^[a-f0-9]{64}$/i.test(token)) {
+        return res.status(400).json({ error: 'Invalid or expired password reset token' });
+    }
+    if (newPassword.length < 9 || newPassword.length > 128) {
+        return res.status(400).json({ error: 'Choose a password between 9 and 128 characters' });
+    }
+
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+        const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
+        const redeemed = await client.query(
+            'UPDATE password_resets SET used_at = NOW() WHERE token_hash = $1 AND used_at IS NULL AND expires_at > NOW() RETURNING user_id',
+            [tokenHash]
+        );
+        if (!redeemed.rows.length) {
+            await client.query('ROLLBACK');
+            return res.status(400).json({ error: 'Invalid or expired password reset token' });
+        }
+
+        const userId = redeemed.rows[0].user_id;
+        const passwordHash = await bcrypt.hash(newPassword, 12);
+        await client.query('UPDATE users SET password = $1, must_change_password = false WHERE id = $2', [passwordHash, userId]);
+        await client.query('DELETE FROM password_resets WHERE user_id = $1', [userId]);
+        await client.query('COMMIT');
+        for (const [sessionToken, session] of sessions) {
+            if (session.userId === userId) sessions.delete(sessionToken);
+        }
+        return res.json({ message: 'Password updated. You can now sign in.' });
+    } catch (error) {
+        await client.query('ROLLBACK').catch(() => {});
+        console.error('Password reset failed:', error.message);
+        return res.status(500).json({ error: 'Could not reset password' });
+    } finally {
+        client.release();
+    }
 });
 
 app.post('/api/auth/change-password', async (req, res) => {
@@ -915,6 +1178,9 @@ app.post('/api/auth/login', async (req, res) => {
         }
 
         const user = rows[0];
+        if (user.role === 'caretaker' && !hostelsSeed.some((hostel) => hostel.id === user.hostel_id)) {
+            return res.status(401).json({ error: 'Invalid credentials' });
+        }
         const token = createToken(user);
         return res.json({ token, user: publicUser(user), mustChangePassword: Boolean(user.must_change_password) });
     } catch (error) {
