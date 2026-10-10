@@ -3,7 +3,7 @@ const crypto = require('crypto');
 const EventEmitter = require('events');
 const bcrypt = require('bcryptjs');
 const { Pool } = require('pg');
-const { campusDateKey, isDateOnly } = require('./campus_time');
+
 const { campusDateKey, isDateOnly, matchesCampusDate } = require('./campus_time');
 const { mailProvider, sendMail } = require('./mailer');
 require('dotenv').config();
