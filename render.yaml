@@ -10,6 +10,14 @@ services:
     envVars:
       - key: PORT
         value: 8080
+    runtime: node
+    plan: free
+    rootDir: .
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: NODE_ENV
+        value: production
       - key: API_SECRET_KEY
         sync: false
       - key: JWT_SECRET

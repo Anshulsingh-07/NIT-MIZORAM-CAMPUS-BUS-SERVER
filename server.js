@@ -4,6 +4,7 @@ const EventEmitter = require('events');
 const bcrypt = require('bcryptjs');
 const { Pool } = require('pg');
 const { campusDateKey, isDateOnly } = require('./campus_time');
+const { campusDateKey, isDateOnly, matchesCampusDate } = require('./campus_time');
 const { mailProvider, sendMail } = require('./mailer');
 require('dotenv').config();
 
@@ -218,6 +219,18 @@ function mapSchedule(row) {
     };
 }
 
+function mapScheduleForToday(row) {
+    if (!row.schedule_id || !row.schedule_date) return null;
+    const todayKey = today();
+    const scheduleDate = row.schedule_date instanceof Date
+        ? campusDateKey(row.schedule_date)
+        : String(row.schedule_date).slice(0, 10);
+    if (!matchesCampusDate(scheduleDate, todayKey)) {
+        return null;
+    }
+    return mapSchedule(row);
+}
+
 function mapBus(row) {
     return {
         busNumber: row.bus_number,
@@ -241,7 +254,7 @@ function mapBus(row) {
                 isActive: !!row.driver_is_active,
             }
             : null,
-        schedule: mapSchedule(row),
+        schedule: mapScheduleForToday(row),
     };
 }
 
