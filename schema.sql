@@ -18,6 +18,9 @@ CREATE TABLE IF NOT EXISTS users (
   FOREIGN KEY (hostel_id) REFERENCES hostels(id) ON DELETE SET NULL
 );
 
+ALTER TABLE users ADD COLUMN IF NOT EXISTS must_change_password BOOLEAN NOT NULL DEFAULT false;
+CREATE UNIQUE INDEX IF NOT EXISTS users_email_lower_unique ON users (LOWER(email));
+
 CREATE TABLE IF NOT EXISTS buses (
   bus_number INT PRIMARY KEY,
   assigned_hostel VARCHAR(10) NOT NULL,
@@ -34,27 +37,15 @@ CREATE TABLE IF NOT EXISTS buses (
 CREATE TABLE IF NOT EXISTS drivers (
   id VARCHAR(40) PRIMARY KEY,
   bus_number INT NOT NULL UNIQUE,
-  name VARCHAR(120) NOT NULL,
-  phone VARCHAR(30) NOT NULL,
+  name VARCHAR(120) NULL,
+  phone VARCHAR(30) NULL,
+  pin_hash VARCHAR(100) NULL,
   is_active BOOLEAN NOT NULL DEFAULT true,
   FOREIGN KEY (bus_number) REFERENCES buses(bus_number) ON DELETE CASCADE
 );
 
-CREATE TABLE IF NOT EXISTS driver_accounts (
-  id VARCHAR(40) PRIMARY KEY,
-  name VARCHAR(120) NOT NULL,
-  phone VARCHAR(10) NOT NULL UNIQUE,
-  pin_hash VARCHAR(100) NOT NULL,
-  bus_number INT NOT NULL REFERENCES buses(bus_number),
-  status VARCHAR(20) NOT NULL DEFAULT 'pending',
-  failed_attempts INT NOT NULL DEFAULT 0,
-  locked_until TIMESTAMP NULL,
-  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  approved_at TIMESTAMP NULL
-);
-
-CREATE UNIQUE INDEX IF NOT EXISTS driver_accounts_approved_bus_unique
-  ON driver_accounts (bus_number) WHERE status IN ('pending','approved');
+ALTER TABLE drivers ADD COLUMN IF NOT EXISTS pin_hash VARCHAR(100) NULL;
+DROP INDEX IF EXISTS drivers_active_phone_unique;
 
 
 CREATE TABLE IF NOT EXISTS schedules (
@@ -70,6 +61,32 @@ CREATE TABLE IF NOT EXISTS schedules (
   FOREIGN KEY (bus_number) REFERENCES buses(bus_number) ON DELETE CASCADE
 );
 
+-- Schedule dates are campus calendar dates (IST) stored as SQL DATE, never timestamps.
+-- If an older deployment used timestamp columns, convert instants to their IST day.
+DO $$
+DECLARE
+  stored_type TEXT;
+  date_expression TEXT;
+  has_collisions BOOLEAN;
+BEGIN
+  SELECT data_type INTO stored_type
+  FROM information_schema.columns
+  WHERE table_schema = current_schema() AND table_name = 'schedules' AND column_name = 'date';
+  IF stored_type IS NOT NULL AND stored_type <> 'date' THEN
+    IF stored_type = 'timestamp with time zone' THEN
+      date_expression := '(date AT TIME ZONE ''Asia/Kolkata'')::date';
+    ELSE
+      date_expression := 'date::date';
+    END IF;
+    EXECUTE format('SELECT EXISTS (SELECT 1 FROM schedules GROUP BY bus_number, %s HAVING COUNT(*) > 1)', date_expression)
+      INTO has_collisions;
+    IF has_collisions THEN
+      RAISE EXCEPTION 'schedules date migration found duplicate records for one bus and IST date';
+    END IF;
+    EXECUTE format('ALTER TABLE schedules ALTER COLUMN date TYPE DATE USING %s', date_expression);
+  END IF;
+END $$;
+
 CREATE TABLE IF NOT EXISTS notifications (
   id VARCHAR(40) PRIMARY KEY,
   title VARCHAR(160) NOT NULL,
@@ -78,10 +95,29 @@ CREATE TABLE IF NOT EXISTS notifications (
   bus_number INT NULL,
   target_hostel VARCHAR(10) NULL,
   sent_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  expires_at TIMESTAMP NOT NULL DEFAULT (CURRENT_TIMESTAMP + INTERVAL '30 days'),
   is_read BOOLEAN NOT NULL DEFAULT false,
   sent_by VARCHAR(120) NULL,
   FOREIGN KEY (target_hostel) REFERENCES hostels(id) ON DELETE SET NULL
 );
+
+CREATE TABLE IF NOT EXISTS reports (
+  id VARCHAR(40) PRIMARY KEY,
+  reporter_id VARCHAR(40) NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  hostel_id VARCHAR(10) NOT NULL REFERENCES hostels(id),
+  bus_number INT NULL REFERENCES buses(bus_number) ON DELETE SET NULL,
+  category VARCHAR(40) NOT NULL,
+  message TEXT NOT NULL,
+  status VARCHAR(20) NOT NULL DEFAULT 'open',
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS reports_hostel_created_idx ON reports (hostel_id, created_at DESC);
+
+ALTER TABLE notifications ADD COLUMN IF NOT EXISTS expires_at TIMESTAMP;
+UPDATE notifications SET expires_at = sent_at + INTERVAL '30 days' WHERE expires_at IS NULL;
+ALTER TABLE notifications ALTER COLUMN expires_at SET DEFAULT (CURRENT_TIMESTAMP + INTERVAL '30 days');
+ALTER TABLE notifications ALTER COLUMN expires_at SET NOT NULL;
+CREATE INDEX IF NOT EXISTS notifications_expires_at_idx ON notifications (expires_at);
 
 CREATE TABLE IF NOT EXISTS telemetry (
   id SERIAL PRIMARY KEY,
@@ -91,6 +127,7 @@ CREATE TABLE IF NOT EXISTS telemetry (
   lng NUMERIC(10,6) NOT NULL,
   speed NUMERIC(8,2) NOT NULL DEFAULT 0,
   accuracy NUMERIC(8,2) NOT NULL DEFAULT 1.0,
+  heading NUMERIC(6,2) NOT NULL DEFAULT 0,
   has_fix BOOLEAN NOT NULL DEFAULT false,
   satellites INT NOT NULL DEFAULT 0,
   hdop NUMERIC(6,2) NOT NULL DEFAULT 99.9,
@@ -104,5 +141,6 @@ ALTER TABLE telemetry ADD COLUMN IF NOT EXISTS has_fix BOOLEAN NOT NULL DEFAULT 
 ALTER TABLE telemetry ADD COLUMN IF NOT EXISTS satellites INT NOT NULL DEFAULT 0;
 ALTER TABLE telemetry ADD COLUMN IF NOT EXISTS hdop NUMERIC(6,2) NOT NULL DEFAULT 99.9;
 ALTER TABLE telemetry ADD COLUMN IF NOT EXISTS net_type VARCHAR(20) NOT NULL DEFAULT 'unknown';
+ALTER TABLE telemetry ADD COLUMN IF NOT EXISTS heading NUMERIC(6,2) NOT NULL DEFAULT 0;
 
 -- End of schema

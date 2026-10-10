@@ -1,6 +1,15 @@
 services:
   - type: web
     name: nitmz-campus-bus-server
+    env: node
+    plan: free
+    region: oregon
+    rootDir: .
+    buildCommand: npm install
+    startCommand: node server.js
+    envVars:
+      - key: PORT
+        value: 8080
     runtime: node
     plan: free
     rootDir: .
