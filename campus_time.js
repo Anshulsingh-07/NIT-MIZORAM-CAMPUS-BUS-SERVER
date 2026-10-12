@@ -43,11 +43,6 @@ function isDateOnly(value) {
     return !Number.isNaN(parsed.getTime()) && parsed.toISOString().slice(0, 10) === value;
 }
 
-module.exports = { CAMPUS_TIME_ZONE, campusDateKey, isDateOnly };
-    const normalized = normalizeCampusDate(value);
-    return normalized !== '' && normalized === value.trim();
-}
-
 function matchesCampusDate(value, expected) {
     const actual = normalizeCampusDate(value);
     const wanted = normalizeCampusDate(expected);
