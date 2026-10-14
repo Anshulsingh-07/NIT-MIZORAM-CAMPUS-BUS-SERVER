@@ -17,7 +17,11 @@ function parseSender(value) {
     return { name: name || email.split('@')[0], email };
 }
 
-async function sendMail({ to, subject, text, html }, { env = process.env, fetchImpl = globalThis.fetch } = {}) {
+async function sendMail({ to, subject, text, html }, {
+    env = process.env,
+    fetchImpl = globalThis.fetch,
+    timeoutMs = 8000,
+} = {}) {
     const provider = mailProvider(env);
     if (!provider) throw new Error('Configure MAIL_FROM and a mail provider API key');
     if (typeof fetchImpl !== 'function') throw new Error('A fetch implementation is required');
@@ -55,11 +59,35 @@ async function sendMail({ to, subject, text, html }, { env = process.env, fetchI
         };
     }
 
-    const response = await fetchImpl(url, {
-        method: 'POST',
-        headers,
-        body: JSON.stringify(body),
+    const controller = new AbortController();
+    let timeout;
+    const deadline = new Promise((_, reject) => {
+        timeout = setTimeout(() => {
+            controller.abort();
+            const error = new Error(`${provider} mail request timed out`);
+            error.name = 'TimeoutError';
+            reject(error);
+        }, timeoutMs);
     });
+    let response;
+    try {
+        response = await Promise.race([
+            fetchImpl(url, {
+                method: 'POST',
+                headers,
+                body: JSON.stringify(body),
+                signal: controller.signal,
+            }),
+            deadline,
+        ]);
+    } catch (error) {
+        if (error.name === 'TimeoutError' || error.name === 'AbortError') {
+            throw new Error(`${provider} mail request timed out`);
+        }
+        throw new Error(`${provider} mail request failed`);
+    } finally {
+        clearTimeout(timeout);
+    }
     if (!response.ok) {
         const details = typeof response.text === 'function' ? await response.text() : '';
         throw new Error(`${provider} mail request failed (${response.status})${details ? `: ${details}` : ''}`);

@@ -77,3 +77,17 @@ test('sendMail rejects missing configuration and non-2xx responses', async () =>
         /brevo mail request failed \(401\): unauthorized/
     );
 });
+
+test('sendMail aborts a provider request that exceeds its timeout', async () => {
+    await assert.rejects(sendMail(message, {
+        env: { RESEND_API_KEY: 'secret', MAIL_FROM: 'bus@example.com' },
+        timeoutMs: 5,
+        fetchImpl: (_url, options) => new Promise((_, reject) => {
+            options.signal.addEventListener('abort', () => {
+                const error = new Error('request aborted');
+                error.name = 'TimeoutError';
+                reject(error);
+            }, { once: true });
+        }),
+    }), /resend mail request timed out/);
+});

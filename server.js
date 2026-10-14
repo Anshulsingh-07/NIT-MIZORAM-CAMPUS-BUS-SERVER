@@ -5,6 +5,10 @@ const bcrypt = require('bcryptjs');
 const { Pool } = require('pg');
 const { campusDateKey, isDateOnly, matchesCampusDate } = require('./campus_time');
 const { mailProvider, sendMail } = require('./mailer');
+const { smsProvider, sendSms } = require('./sms');
+const { canAuthenticateUser } = require('./auth_credentials');
+const { createPasswordRecoveryRouter } = require('./password_recovery');
+const { createPasswordRecoveryStore } = require('./password_recovery_store');
 require('dotenv').config();
 
 if (process.env.NODE_ENV === 'production' && !process.env.API_SECRET_KEY) {
@@ -77,9 +81,7 @@ const notificationsSeed = [
 const sessions = new Map();
 const driverLoginFailures = new Map();
 const driverLastFixes = new Map();
-const forgotPasswordEmailLimits = new Map();
-const forgotPasswordIpLimits = new Map();
-const resetPasswordIpLimits = new Map();
+const passwordRecoveryStore = createPasswordRecoveryStore(() => pool);
 
 // Schedule calendar dates belong to the campus, whose civil timezone is IST.
 const today = () => campusDateKey(new Date());
@@ -417,6 +419,8 @@ async function initializeDatabase() {
             connectionString: process.env.DATABASE_URL,
             ssl: { rejectUnauthorized: false },
             max: Number(process.env.PG_POOL_MAX || 20),
+            connectionTimeoutMillis: Number(process.env.DB_CONNECTION_TIMEOUT_MS || 5000),
+            query_timeout: Number(process.env.DB_QUERY_TIMEOUT_MS || 8000),
             idleTimeoutMillis: 30000,
         }
         : {
@@ -426,6 +430,8 @@ async function initializeDatabase() {
             password: DB_PASSWORD,
             database: DB_NAME,
             max: Number(process.env.PG_POOL_MAX || 20),
+            connectionTimeoutMillis: Number(process.env.DB_CONNECTION_TIMEOUT_MS || 5000),
+            query_timeout: Number(process.env.DB_QUERY_TIMEOUT_MS || 8000),
             idleTimeoutMillis: 30000,
             ssl: process.env.DB_SSL === 'true' || DB_HOST.includes('supabase') ? { rejectUnauthorized: false } : false,
         };
@@ -454,8 +460,10 @@ CREATE TABLE IF NOT EXISTS users (
 );
 `);
     await q('ALTER TABLE users ADD COLUMN IF NOT EXISTS must_change_password BOOLEAN NOT NULL DEFAULT false');
-        await q('ALTER TABLE users ADD COLUMN IF NOT EXISTS recovery_email VARCHAR(120) NULL');
-        await q(`
+    await q('ALTER TABLE users ADD COLUMN IF NOT EXISTS recovery_email VARCHAR(120) NULL');
+    await q('ALTER TABLE users ADD COLUMN IF NOT EXISTS recovery_phone VARCHAR(20) NULL');
+    await q('ALTER TABLE users ADD COLUMN IF NOT EXISTS recovery_phone_verified_at TIMESTAMPTZ NULL');
+    await q(`
 CREATE TABLE IF NOT EXISTS password_resets (
     id SERIAL PRIMARY KEY,
     user_id VARCHAR(40) NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -465,6 +473,25 @@ CREATE TABLE IF NOT EXISTS password_resets (
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 `);
+    await q(`UPDATE password_resets
+        SET expires_at = LEAST(expires_at, created_at + INTERVAL '15 minutes')
+        WHERE used_at IS NULL`);
+    await q(`
+CREATE TABLE IF NOT EXISTS password_reset_otps (
+    id BIGSERIAL PRIMARY KEY,
+    user_id VARCHAR(40) NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    otp_hash CHAR(64) NOT NULL,
+    attempts SMALLINT NOT NULL DEFAULT 0 CHECK (attempts BETWEEN 0 AND 5),
+    expires_at TIMESTAMPTZ NOT NULL,
+    used_at TIMESTAMPTZ NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+`);
+    await q(`CREATE INDEX IF NOT EXISTS password_reset_otps_user_created_idx
+        ON password_reset_otps (user_id, created_at DESC)`);
+    await q(`CREATE UNIQUE INDEX IF NOT EXISTS users_verified_recovery_phone_unique
+        ON users (recovery_phone)
+        WHERE recovery_phone IS NOT NULL AND recovery_phone_verified_at IS NOT NULL`);
     const duplicateEmails = await q('SELECT LOWER(email) AS email FROM users GROUP BY LOWER(email) HAVING COUNT(*) > 1');
     if (duplicateEmails.length) {
         throw new Error('Duplicate email accounts must be resolved before the server can start');
@@ -1011,6 +1038,7 @@ app.get('/reset-password', (_req, res) => {
       <button type="submit">Update password</button>
     </form>
     <p id="message" role="status"></p>
+    <a id="back-to-login" href="smartbus://login" hidden>Back to Login</a>
   </main>
   <script>
     const tokenMatch = location.hash.match(/^#token=([a-f0-9]{64})$/i);
@@ -1038,8 +1066,11 @@ app.get('/reset-password', (_req, res) => {
           body: JSON.stringify({ token, newPassword: password })
         });
         const result = await response.json();
-        message.textContent = response.ok ? result.message : (result.error || 'Could not reset password.');
-        if (response.ok) form.hidden = true;
+                message.textContent = result.message || result.error || 'Could not reset password.';
+                if (response.ok) {
+                    form.hidden = true;
+                    document.getElementById('back-to-login').hidden = false;
+                }
       } catch (_) {
         message.textContent = 'Could not reach the server. Try again.';
       }
@@ -1049,102 +1080,17 @@ app.get('/reset-password', (_req, res) => {
 </html>`);
 });
 
-app.post('/api/auth/forgot-password', (req, res) => {
-    const email = String(req.body?.email || '').trim().toLowerCase();
-    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
-        return res.status(400).json({ error: 'Enter a valid email address' });
-    }
-
-    const ip = req.ip || req.socket.remoteAddress || 'unknown';
-    const withinEmailLimit = consumeSlidingWindowLimit(forgotPasswordEmailLimits, email, 3, 15 * 60 * 1000);
-    const withinIpLimit = consumeSlidingWindowLimit(forgotPasswordIpLimits, ip, 10, 60 * 60 * 1000);
-    if (!withinEmailLimit || !withinIpLimit) {
-        return res.status(429).json({ error: 'Too many password reset requests. Try again later.' });
-    }
-
-    if (process.env.NODE_ENV === 'production' && !mailProvider(process.env)) {
-        return res.status(503).json({
-            error: 'Password reset is unavailable until verified email delivery is configured. Contact an administrator.',
-        });
-    }
-
-    res.once('finish', () => {
-        setImmediate(() => {
-            void (async () => {
-                const users = await q('SELECT id, email, recovery_email FROM users WHERE LOWER(email) = LOWER(?) LIMIT 1', [email]);
-                const user = users[0];
-                if (!user) return;
-
-                const token = crypto.randomBytes(32).toString('hex');
-                const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
-                await q('DELETE FROM password_resets WHERE user_id = ? AND used_at IS NULL', [user.id]);
-                await q("INSERT INTO password_resets (user_id, token_hash, expires_at) VALUES (?, ?, NOW() + INTERVAL '30 minutes')", [user.id, tokenHash]);
-
-                const configuredBaseUrl = process.env.PUBLIC_BASE_URL || process.env.RENDER_EXTERNAL_URL;
-                const baseUrl = (configuredBaseUrl || `http://localhost:${port}`).replace(/\/+$/, '');
-                const resetUrl = `${baseUrl}/reset-password#token=${token}`;
-                const mail = {
-                    to: user.recovery_email || user.email,
-                    subject: 'Campus Bus Tracker password reset',
-                    text: `Use this link to reset your password. It expires in 30 minutes:\n${resetUrl}`,
-                    html: `<p>Use this link to reset your password. It expires in 30 minutes:</p><p><a href="${resetUrl}">Reset password</a></p>`,
-                };
-                if (mailProvider(process.env)) {
-                    await sendMail(mail);
-                } else {
-                    console.info(`Development password reset link for ${email}: ${resetUrl}`);
-                }
-            })().catch((error) => console.error('Password reset request could not be processed:', error.message));
-        });
-    });
-    return res.status(200).json({ message: 'If an account exists for this email, password reset instructions will be sent.' });
-});
-
-app.post('/api/auth/reset-password', async (req, res) => {
-    const ip = req.ip || req.socket.remoteAddress || 'unknown';
-    if (!consumeSlidingWindowLimit(resetPasswordIpLimits, ip, 20, 15 * 60 * 1000)) {
-        return res.status(429).json({ error: 'Too many password reset attempts. Try again later.' });
-    }
-
-    const token = String(req.body?.token || '');
-    const newPassword = String(req.body?.newPassword || '');
-    if (!/^[a-f0-9]{64}$/i.test(token)) {
-        return res.status(400).json({ error: 'Invalid or expired password reset token' });
-    }
-    if (newPassword.length < 9 || newPassword.length > 128) {
-        return res.status(400).json({ error: 'Choose a password between 9 and 128 characters' });
-    }
-
-    const client = await pool.connect();
-    try {
-        await client.query('BEGIN');
-        const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
-        const redeemed = await client.query(
-            'UPDATE password_resets SET used_at = NOW() WHERE token_hash = $1 AND used_at IS NULL AND expires_at > NOW() RETURNING user_id',
-            [tokenHash]
-        );
-        if (!redeemed.rows.length) {
-            await client.query('ROLLBACK');
-            return res.status(400).json({ error: 'Invalid or expired password reset token' });
-        }
-
-        const userId = redeemed.rows[0].user_id;
-        const passwordHash = await bcrypt.hash(newPassword, 12);
-        await client.query('UPDATE users SET password = $1, must_change_password = false WHERE id = $2', [passwordHash, userId]);
-        await client.query('DELETE FROM password_resets WHERE user_id = $1', [userId]);
-        await client.query('COMMIT');
-        for (const [sessionToken, session] of sessions) {
-            if (session.userId === userId) sessions.delete(sessionToken);
-        }
-        return res.json({ message: 'Password updated. You can now sign in.' });
-    } catch (error) {
-        await client.query('ROLLBACK').catch(() => {});
-        console.error('Password reset failed:', error.message);
-        return res.status(500).json({ error: 'Could not reset password' });
-    } finally {
-        client.release();
-    }
-});
+app.use('/api/auth', createPasswordRecoveryRouter({
+    store: passwordRecoveryStore,
+    sessions,
+    emailConfigured: () => Boolean(mailProvider(process.env)),
+    sendMail,
+    smsConfigured: () => Boolean(smsProvider(process.env)),
+    sendSms,
+    otpSecret: () => process.env.PASSWORD_RESET_OTP_SECRET || API_SECRET_KEY,
+    baseUrl: () => process.env.PUBLIC_BASE_URL || process.env.RENDER_EXTERNAL_URL || `http://localhost:${port}`,
+    production: process.env.NODE_ENV === 'production',
+}));
 
 app.post('/api/auth/change-password', async (req, res) => {
     const auth = requireAuth(req, res);
@@ -1169,16 +1115,8 @@ app.post('/api/auth/login', async (req, res) => {
         const email = String(req.body?.email || '').trim().toLowerCase();
         const password = String(req.body?.password || '');
         const rows = await q('SELECT id, name, email, role, hostel_id, password, must_change_password FROM users WHERE LOWER(email) = LOWER(?) LIMIT 1', [email]);
-        const storedPassword = rows[0]?.password || '';
-        const isBcryptHash = /^\$2[aby]\$/.test(storedPassword);
-        const passwordMatches = rows.length > 0 && isBcryptHash
-            && await bcrypt.compare(password, storedPassword);
-        if (!passwordMatches) {
-            return res.status(401).json({ error: 'Invalid credentials' });
-        }
-
         const user = rows[0];
-        if (user.role === 'caretaker' && !hostelsSeed.some((hostel) => hostel.id === user.hostel_id)) {
+        if (!await canAuthenticateUser(user, password, hostelsSeed)) {
             return res.status(401).json({ error: 'Invalid credentials' });
         }
         const token = createToken(user);
@@ -1188,7 +1126,7 @@ app.post('/api/auth/login', async (req, res) => {
     }
 });
 
-app.post('/api/auth/driver-login', async (req, res) => {
+ app.post('/api/auth/driver-login', async (req, res) => {
     const phone = String(req.body?.phone || '').replace(/\D/g, '').slice(-10);
     const pin = String(req.body?.pin || '');
     if (!/^[6-9]\d{9}$/.test(phone) || !/^\d{6}$/.test(pin)) {
