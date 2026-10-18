@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'package:app_links/app_links.dart';
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
@@ -7,7 +8,10 @@ import 'services/api_service.dart';
 import 'services/auth_service.dart';
 import 'services/bus_service.dart';
 import 'services/notification_service.dart';
+import 'screens/auth/login_screen.dart';
 import 'screens/splash_screen.dart';
+
+final GlobalKey<NavigatorState> _appNavigatorKey = GlobalKey<NavigatorState>();
 
 void main() async {
   runZonedGuarded(
@@ -73,8 +77,48 @@ void main() async {
   );
 }
 
-class CampusBusTrackerApp extends StatelessWidget {
+class CampusBusTrackerApp extends StatefulWidget {
   const CampusBusTrackerApp({super.key});
+
+  @override
+  State<CampusBusTrackerApp> createState() => _CampusBusTrackerAppState();
+}
+
+class _CampusBusTrackerAppState extends State<CampusBusTrackerApp> {
+  final AppLinks _appLinks = AppLinks();
+  StreamSubscription<Uri>? _linkSubscription;
+
+  @override
+  void initState() {
+    super.initState();
+    _linkSubscription = _appLinks.uriLinkStream.listen(_handleAppLink);
+    WidgetsBinding.instance.addPostFrameCallback((_) async {
+      try {
+        final initialLink = await _appLinks.getInitialLink();
+        if (initialLink != null) _handleAppLink(initialLink);
+      } catch (_) {}
+    });
+  }
+
+  void _handleAppLink(Uri uri) {
+    if (uri.scheme != 'smartbus' ||
+        uri.host != 'login' ||
+        uri.path.isNotEmpty ||
+        uri.hasQuery ||
+        uri.hasFragment) {
+      return;
+    }
+    _appNavigatorKey.currentState?.pushAndRemoveUntil(
+      MaterialPageRoute(builder: (_) => const LoginScreen()),
+      (_) => false,
+    );
+  }
+
+  @override
+  void dispose() {
+    _linkSubscription?.cancel();
+    super.dispose();
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -86,6 +130,7 @@ class CampusBusTrackerApp extends StatelessWidget {
         Provider(create: (_) => ApiService()),
       ],
       child: MaterialApp(
+        navigatorKey: _appNavigatorKey,
         title: 'Campus Bus Tracker',
         debugShowCheckedModeBanner: false,
         theme: ThemeData(

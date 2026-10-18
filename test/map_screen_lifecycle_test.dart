@@ -7,7 +7,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:provider/provider.dart';
 
 void main() {
-  testWidgets('MapScreen can unmount without disposing a still-bound ChangeNotifier', (tester) async {
+  testWidgets('MapScreen can unmount without throwing during dispose', (tester) async {
     await tester.pumpWidget(
       MultiProvider(
         providers: [
@@ -19,7 +19,10 @@ void main() {
       ),
     );
     await tester.pump();
+    expect(tester.takeException(), isNull);
 
     await tester.pumpWidget(const SizedBox());
+    await tester.pumpAndSettle();
+    expect(tester.takeException(), isNull);
   });
 }

@@ -1,11 +1,13 @@
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import '../../services/auth_service.dart';
 import '../../services/api_service.dart';
 import '../../models/models.dart';
 import '../student/student_home.dart';
 import '../admin/admin_home.dart';
 import '../driver/driver_home.dart';
+import 'forgot_password_screen.dart';
 import 'password_change_screen.dart';
 
 class LoginScreen extends StatefulWidget {
@@ -24,8 +26,8 @@ class _LoginScreenState extends State<LoginScreen>
   final _phoneCtrl = TextEditingController();
   final _pinCtrl = TextEditingController();
   bool _obscurePass = true;
+  bool _rememberCaretakerEmail = false;
   bool _isRegister = false;
-  bool _isResettingPassword = false;
   final _nameCtrl = TextEditingController();
   String _selectedHostel = 'BH1';
   late AnimationController _animCtrl;
@@ -62,7 +64,32 @@ class _LoginScreenState extends State<LoginScreen>
       _isAdmin = isAdmin;
       _emailCtrl.clear();
       _passCtrl.clear();
+      _rememberCaretakerEmail = false;
     });
+    if (isAdmin) _loadRememberedCaretakerEmail();
+  }
+
+  Future<void> _loadRememberedCaretakerEmail() async {
+    final prefs = await SharedPreferences.getInstance();
+    final email = prefs.getString('remembered_caretaker_email');
+    if (!mounted || !_isAdmin || email == null || email.isEmpty) return;
+    setState(() {
+      _emailCtrl.text = email;
+      _rememberCaretakerEmail = true;
+    });
+  }
+
+  Future<void> _setRememberCaretakerEmail(bool remember) async {
+    setState(() => _rememberCaretakerEmail = remember);
+    final prefs = await SharedPreferences.getInstance();
+    if (!remember) {
+      await prefs.remove('remembered_caretaker_email');
+    } else if (_emailCtrl.text.trim().isNotEmpty) {
+      await prefs.setString(
+        'remembered_caretaker_email',
+        _emailCtrl.text.trim(),
+      );
+    }
   }
 
   Future<void> _handleLogin() async {
@@ -109,6 +136,13 @@ class _LoginScreenState extends State<LoginScreen>
       _passCtrl.text,
       api,
     );
+    if (success && _isAdmin && _rememberCaretakerEmail) {
+      final email = _emailCtrl.text.trim();
+      if (email.isNotEmpty) {
+        final prefs = await SharedPreferences.getInstance();
+        await prefs.setString('remembered_caretaker_email', email);
+      }
+    }
     if (success && mounted) {
       Navigator.pushReplacement(
         context,
@@ -120,35 +154,6 @@ class _LoginScreenState extends State<LoginScreen>
               : const StudentHome(),
         ),
       );
-    }
-  }
-
-  Future<void> _forgotPassword() async {
-    final email = _emailCtrl.text.trim();
-    if (email.isEmpty) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Enter your college email first.')),
-      );
-      return;
-    }
-    setState(() => _isResettingPassword = true);
-    try {
-      final message = await context.read<ApiService>().forgotPassword(email);
-      if (mounted) {
-        ScaffoldMessenger.of(
-          context,
-        ).showSnackBar(SnackBar(content: Text(message)));
-      }
-    } catch (error) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text(error.toString().replaceFirst('Exception: ', '')),
-          ),
-        );
-      }
-    } finally {
-      if (mounted) setState(() => _isResettingPassword = false);
     }
   }
 
@@ -290,22 +295,30 @@ class _LoginScreenState extends State<LoginScreen>
                           const SizedBox(height: 14),
                           _buildPasswordField(),
                           const SizedBox(height: 14),
+                          if (_isAdmin && !_isRegister)
+                            CheckboxListTile(
+                              contentPadding: EdgeInsets.zero,
+                              controlAffinity: ListTileControlAffinity.leading,
+                              title: const Text('Remember email'),
+                              value: _rememberCaretakerEmail,
+                              onChanged: (remember) {
+                                if (remember != null) {
+                                  _setRememberCaretakerEmail(remember);
+                                }
+                              },
+                            ),
                           if (!_isRegister)
                             Align(
                               alignment: Alignment.centerRight,
                               child: TextButton(
-                                onPressed: _isResettingPassword
-                                    ? null
-                                    : _forgotPassword,
-                                child: _isResettingPassword
-                                    ? const SizedBox(
-                                        width: 16,
-                                        height: 16,
-                                        child: CircularProgressIndicator(
-                                          strokeWidth: 2,
-                                        ),
-                                      )
-                                    : const Text('Forgot password?'),
+                                onPressed: () => Navigator.push(
+                                  context,
+                                  MaterialPageRoute(
+                                    builder: (_) =>
+                                        const ForgotPasswordScreen(),
+                                  ),
+                                ),
+                                child: const Text('Forgot password?'),
                               ),
                             ),
                           if (_isRegister) _buildHostelDropdown(),
@@ -384,7 +397,7 @@ class _LoginScreenState extends State<LoginScreen>
 
                 // Bottom info
                 Text(
-                  ' Developed By : Anshul Singh and Dilip Sahu',
+                  ' Developed By : Anshul Singh ',
                   style: TextStyle(color: Colors.blue.shade800, fontSize: 12),
                 ),
                 const SizedBox(height: 20),

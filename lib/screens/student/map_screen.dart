@@ -10,7 +10,6 @@ import 'package:permission_handler/permission_handler.dart';
 import 'package:url_launcher/url_launcher.dart';
 import 'package:flutter_tts/flutter_tts.dart';
 import 'package:share_plus/share_plus.dart';
-import 'package:shared_preferences/shared_preferences.dart';
 import 'package:wakelock_plus/wakelock_plus.dart';
 import 'package:http/http.dart' as http;
 import '../../controllers/navigation_controller.dart';
@@ -78,6 +77,148 @@ class _MapOverlayNotifier extends ChangeNotifier {
   void update(_MapOverlaySnapshot snapshot) {
     _snapshot = snapshot;
     notifyListeners();
+  }
+}
+
+class BusIssueReportDialog extends StatefulWidget {
+  final String token;
+  final String? busKey;
+  final int? busNumber;
+
+  const BusIssueReportDialog({
+    super.key,
+    required this.token,
+    this.busKey,
+    this.busNumber,
+  });
+
+  @override
+  State<BusIssueReportDialog> createState() => _BusIssueReportDialogState();
+}
+
+class _BusIssueReportDialogState extends State<BusIssueReportDialog> {
+  final TextEditingController _controller = TextEditingController();
+  bool _isSubmitting = false;
+  String? _error;
+  bool _isSubmitted = false;
+
+  String _friendlyError(Object error) {
+    final raw = error.toString().replaceFirst('Exception: ', '').trim();
+    if (raw.isEmpty) {
+      return 'Could not submit report. Please try again.';
+    }
+    final text = raw.toLowerCase();
+    if (text.contains('offline') || text.contains('unreachable')) {
+      return 'You are offline. Please connect to the network and try again.';
+    }
+    if (text.contains('timed out')) {
+      return 'The server did not respond in time. Please try again.';
+    }
+    return 'Could not submit report. Please try again.';
+  }
+
+  Future<void> _submit() async {
+    final message = _controller.text.trim();
+    if (message.isEmpty || _isSubmitting) return;
+
+    setState(() {
+      _isSubmitting = true;
+      _error = null;
+    });
+
+    try {
+      await context.read<ApiService>().submitReport(
+        widget.token,
+        message: message,
+        category: 'other',
+        busNumber: widget.busNumber,
+      );
+      if (!mounted) return;
+      setState(() {
+        _isSubmitting = false;
+        _isSubmitted = true;
+      });
+    } catch (error) {
+      if (!mounted) return;
+      setState(() {
+        _isSubmitting = false;
+        _error = _friendlyError(error);
+      });
+    }
+  }
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (_isSubmitted) {
+      return AlertDialog(
+        title: const Text('Report sent'),
+        content: const Text('Report submitted successfully.'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(true),
+            child: const Text('Close'),
+          ),
+        ],
+      );
+    }
+
+    return AlertDialog(
+      title: const Text('Report a bus issue'),
+      content: SizedBox(
+        width: 420,
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            if (widget.busKey != null)
+              Padding(
+                padding: const EdgeInsets.only(bottom: 12),
+                child: Align(
+                  alignment: Alignment.centerLeft,
+                  child: Text(
+                    'Bus: ${widget.busKey}',
+                    style: const TextStyle(fontWeight: FontWeight.w600),
+                  ),
+                ),
+              ),
+            TextField(
+              controller: _controller,
+              autofocus: true,
+              onChanged: (_) => setState(() {}),
+              minLines: 3,
+              maxLines: 5,
+              decoration: const InputDecoration(
+                hintText: 'Describe a delay or issue',
+                border: OutlineInputBorder(),
+              ),
+            ),
+            if (_error != null)
+              Padding(
+                padding: const EdgeInsets.only(top: 12),
+                child: Text(
+                  _error!,
+                  style: const TextStyle(color: Colors.red),
+                ),
+              ),
+          ],
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(false),
+          child: const Text('Cancel'),
+        ),
+        FilledButton(
+          onPressed: _isSubmitting || _controller.text.trim().isEmpty ? null : _submit,
+          child: Text(_isSubmitting ? 'Sending...' : 'Send'),
+        ),
+      ],
+    );
   }
 }
 
@@ -283,19 +424,18 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
     _searchDebounce?.cancel();
     _routeUpdateTimer?.cancel();
     _navigationCameraTimer?.cancel();
-    _navigationTelemetry.dispose();
-    // This notifier is provided by ChangeNotifierProvider.value in the widget
-    // tree; disposing it here while listeners still exist triggers the
-    // framework assertion '_dependents.isEmpty'.
     _pulseTimer?.cancel();
     _userPositionSubscription?.cancel();
     _navigation.removeListener(_onNavigationChanged);
     _navigation.dispose();
+    _mapOverlays.dispose();
+    _navigationTelemetry.dispose();
     _tts.stop();
     WakelockPlus.disable();
     _searchController.dispose();
     _searchFocusNode.dispose();
-    // dispose any running animation controllers
+    // _navigation and _mapOverlays are owned by this State; the providers in
+    // main.dart own different service notifiers and should not be disposed here.
     for (final c in _markerControllers.values) {
       c.stop();
       c.dispose();
@@ -1246,45 +1386,37 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
   }
 
   Future<void> _reportIssue() async {
-    final controller = TextEditingController();
-    final report = await showDialog<String>(
-      context: context,
-      builder: (context) => AlertDialog(
-        title: const Text('Report a bus issue'),
-        content: TextField(
-          controller: controller,
-          maxLines: 3,
-          decoration: const InputDecoration(
-            hintText: 'Describe a delay or issue',
-          ),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context),
-            child: const Text('Cancel'),
-          ),
-          FilledButton(
-            onPressed: () => Navigator.pop(context, controller.text),
-            child: const Text('Send'),
-          ),
-        ],
-      ),
-    );
-    controller.dispose();
-    if (report != null && report.trim().isNotEmpty && mounted) {
-      final prefs = await SharedPreferences.getInstance();
-      final saved = prefs.getStringList('bus_issue_reports') ?? <String>[];
-      saved.add(
-        '${DateTime.now().toIso8601String()}|${_selectedBusKey ?? 'bus'}|${report.trim()}',
-      );
-      await prefs.setStringList('bus_issue_reports', saved);
+    final currentUser = context.read<AuthService>().currentUser;
+    final token = currentUser?.token;
+    if (token == null || token.isEmpty) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           const SnackBar(
-            content: Text('Thanks. Your report has been saved for review.'),
+            content: Text('Please sign in again to send a report.'),
           ),
         );
       }
+      return;
+    }
+
+    final selectedBus = _findByKey(_fleet, _selectedBusKey);
+    final submitted = await showDialog<bool>(
+      context: context,
+      builder: (context) => BusIssueReportDialog(
+        token: token,
+        busKey: _selectedBusKey,
+        busNumber: selectedBus == null
+            ? null
+            : int.tryParse(_busKey(selectedBus.busId)),
+      ),
+    );
+
+    if (submitted == true && mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Report submitted successfully.'),
+        ),
+      );
     }
   }
 

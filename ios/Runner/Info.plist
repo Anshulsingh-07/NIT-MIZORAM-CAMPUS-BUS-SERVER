@@ -16,6 +16,17 @@
 	<string>campus_bus_tracker</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleURLName</key>
+			<string>SmartBus Login</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>smartbus</string>
+			</array>
+		</dict>
+	</array>
 	<key>CFBundleShortVersionString</key>
 	<string>$(FLUTTER_BUILD_NAME)</string>
 	<key>CFBundleSignature</key>

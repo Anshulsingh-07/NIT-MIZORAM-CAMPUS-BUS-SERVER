@@ -10,6 +10,9 @@ class ApiService {
   static String get trackingBaseUrl => baseUrl;
   static String get trackingLatestEndpoint => '$baseUrl/location/latest';
   static const Duration _telemetryEndpointBackoff = Duration(seconds: 45);
+  static const Duration _recoveryConnectTimeout = Duration(seconds: 15);
+  static const Duration _recoveryResponseTimeout = Duration(seconds: 10);
+  static const Duration _recoveryOverallTimeout = Duration(seconds: 30);
   static final Map<String, DateTime> _telemetryBackoffUntil = {};
 
   static String _normalizeApiBase(String rawBase) {
@@ -91,6 +94,108 @@ class ApiService {
   static String _unexpectedServerResponseMessage() =>
       'Unexpected server response — please try again.';
 
+  static Map<String, dynamic> decodeRecoveryResponse(http.Response response) {
+    final status = response.statusCode;
+    if (status == 404) {
+      throw Exception(
+        'Password recovery is not available on this server yet. Please try again later.',
+      );
+    }
+    if (status == 401) {
+      throw Exception('We could not verify that request. Please try again.');
+    }
+    if (status == 429) {
+      throw Exception('Too many attempts. Please wait a little and try again.');
+    }
+    if (status >= 500) {
+      throw Exception(
+        'The service is temporarily unavailable. Please try again.',
+      );
+    }
+
+    final contentType = (response.headers['content-type'] ?? '').toLowerCase();
+    final isJson =
+        contentType.contains('application/json') ||
+        contentType.contains('+json');
+    if (!isJson) {
+      if (status >= 400) {
+        throw Exception(
+          'Unable to complete password recovery. Please try again.',
+        );
+      }
+      throw Exception(
+        'The server returned an invalid response. Please try again.',
+      );
+    }
+
+    final dynamic decoded;
+    try {
+      decoded = jsonDecode(response.body);
+    } on FormatException {
+      throw Exception(
+        'The server returned an invalid response. Please try again.',
+      );
+    }
+    if (decoded is! Map<String, dynamic>) {
+      throw Exception(
+        'The server returned an invalid response. Please try again.',
+      );
+    }
+
+    if (status == 400) {
+      throw Exception(
+        decoded['message']?.toString() ??
+            decoded['error']?.toString() ??
+            'Check the details and try again.',
+      );
+    }
+    if (status < 200 || status >= 300 || decoded['success'] != true) {
+      final message = decoded['message']?.toString();
+      throw Exception(
+        message ?? 'Unable to complete password recovery. Please try again.',
+      );
+    }
+    return decoded;
+  }
+
+  static String _recoveryResponseSummary(http.Response response) {
+    final contentType = (response.headers['content-type'] ?? '').toLowerCase();
+    final body = response.body.trim();
+    final isJson =
+        contentType.contains('application/json') ||
+        contentType.contains('+json');
+    if (isJson) {
+      try {
+        final decoded = jsonDecode(body);
+        if (decoded is Map<String, dynamic>) {
+          final code = decoded['code'];
+          final safeCode =
+              code is String && RegExp(r'^[A-Z0-9_]{1,64}$').hasMatch(code)
+              ? code
+              : 'other';
+          final safeKeys = decoded.keys
+              .where(
+                (key) => RegExp(r'^[A-Za-z][A-Za-z0-9_]{0,40}$').hasMatch(key),
+              )
+              .take(12)
+              .join(',');
+          final success = decoded['success'];
+          return 'json keys=$safeKeys '
+              'code=$safeCode '
+              'success=${success is bool ? success : 'unspecified'}';
+        }
+        return 'json shape=${decoded.runtimeType}';
+      } on FormatException {
+        return 'invalid-json bytes=${response.bodyBytes.length}';
+      }
+    }
+    if (body.isEmpty) return 'empty-body';
+    if (body.startsWith('<!doctype html') || body.startsWith('<html')) {
+      return 'html bytes=${response.bodyBytes.length}';
+    }
+    return 'non-json bytes=${response.bodyBytes.length}';
+  }
+
   static void _debugPrintResponse(
     String method,
     Uri uri,
@@ -161,24 +266,107 @@ class ApiService {
     }
   }
 
-  Future<String> forgotPassword(String email) async {
-    final response = await http
-        .post(
-          Uri.parse('$baseUrl/auth/forgot-password'),
-          headers: _headers(),
-          body: jsonEncode({'email': email.trim().toLowerCase()}),
-        )
-        .timeout(const Duration(seconds: 10));
-    final data = _decodeJsonResponse(response);
-    if (response.statusCode == 200 && data is Map<String, dynamic>) {
-      return data['message']?.toString() ??
-          'If this account exists, a default password has been set. Check your email format.';
+  Future<String> requestPasswordRecovery({
+    required String method,
+    required String destination,
+  }) async {
+    final normalizedMethod = method.trim().toLowerCase();
+    final value = destination.trim();
+    final payload = normalizedMethod == 'email'
+        ? {'method': normalizedMethod, 'email': value.toLowerCase()}
+        : {'method': normalizedMethod, 'mobile': value};
+    final data = await _postRecoveryJson('/auth/forgot-password', payload);
+    return data['message']?.toString() ??
+        'If an account exists for these details, recovery instructions will be sent.';
+  }
+
+  Future<String> forgotPassword(String email) =>
+      requestPasswordRecovery(method: 'email', destination: email);
+
+  Future<String> resendPasswordResetOtp(String mobile) async {
+    final data = await _postRecoveryJson('/auth/resend-otp', {
+      'mobile': mobile.trim(),
+    });
+    return data['message']?.toString() ??
+        'If an account exists for these details, recovery instructions will be sent.';
+  }
+
+  Future<String> verifyPasswordResetOtp(String mobile, String otp) async {
+    final data = await _postRecoveryJson('/auth/verify-otp', {
+      'mobile': mobile.trim(),
+      'otp': otp.trim(),
+    });
+    final token = data['resetToken']?.toString();
+    if (token != null && token.isNotEmpty) return token;
+    throw Exception('The server returned an invalid reset response.');
+  }
+
+  Future<String> resetPassword(String token, String newPassword) async {
+    final data = await _postRecoveryJson('/auth/reset-password', {
+      'token': token,
+      'newPassword': newPassword,
+    });
+    return data['message']?.toString() ??
+        'Your password has been reset successfully. Please log in using your new password.';
+  }
+
+  Future<Map<String, dynamic>> _postRecoveryJson(
+    String path,
+    Map<String, dynamic> payload,
+  ) async {
+    final client = http.Client();
+    final stopwatch = Stopwatch()..start();
+    final request = http.Request('POST', Uri.parse('$baseUrl$path'))
+      ..headers.addAll(_headers())
+      ..body = jsonEncode(payload);
+
+    Future<Map<String, dynamic>> performRequest() async {
+      try {
+        final streamedResponse = await client
+            .send(request)
+            .timeout(_recoveryConnectTimeout);
+        final response = await http.Response.fromStream(
+          streamedResponse,
+        ).timeout(_recoveryResponseTimeout);
+        if (kDebugMode) {
+          debugPrint(
+            'Recovery POST ${request.url.path} status=${response.statusCode} '
+            'contentType=${response.headers['content-type'] ?? 'missing'} '
+            'durationMs=${stopwatch.elapsedMilliseconds} '
+            'response=${_recoveryResponseSummary(response)}',
+          );
+        }
+        return decodeRecoveryResponse(response);
+      } on TimeoutException {
+        if (kDebugMode) {
+          debugPrint(
+            'Recovery POST ${request.url.path} timeout '
+            'durationMs=${stopwatch.elapsedMilliseconds}',
+          );
+        }
+        rethrow;
+      } on http.ClientException catch (error) {
+        if (kDebugMode) {
+          debugPrint(
+            'Recovery POST ${request.url.path} networkError=${error.runtimeType} '
+            'durationMs=${stopwatch.elapsedMilliseconds}',
+          );
+        }
+        rethrow;
+      }
     }
-    throw Exception(
-      data is Map<String, dynamic>
-          ? data['error']?.toString() ?? 'Password reset failed'
-          : 'Password reset failed',
-    );
+
+    try {
+      return await performRequest().timeout(_recoveryOverallTimeout);
+    } on TimeoutException {
+      throw Exception(
+        'The server is taking longer than expected. Please try again.',
+      );
+    } on http.ClientException {
+      throw Exception('Unable to connect to the server. Please try again.');
+    } finally {
+      client.close();
+    }
   }
 
   Future<void> changePassword(String token, String newPassword) async {
@@ -198,6 +386,46 @@ class ApiService {
           ? data['error']?.toString() ?? 'Could not update password'
           : 'Could not update password',
     );
+  }
+
+  Future<Map<String, dynamic>> submitReport(
+    String token, {
+    required String message,
+    String category = 'other',
+    int? busNumber,
+  }) async {
+    final uri = Uri.parse('$baseUrl/reports');
+    final payload = {
+      'category': category,
+      'message': message.trim(),
+      if (busNumber != null) 'busNumber': busNumber,
+    };
+
+    try {
+      final response = await http
+          .post(uri, headers: _headers(token), body: jsonEncode(payload))
+          .timeout(const Duration(seconds: 10));
+      _debugPrintResponse('POST', uri, response);
+      final data = response.body.isNotEmpty
+          ? _decodeJsonResponse(response)
+          : <String, dynamic>{};
+      if (response.statusCode == 201 || response.statusCode == 200) {
+        if (data is Map<String, dynamic>) {
+          return data;
+        }
+        throw Exception(_unexpectedServerResponseMessage());
+      }
+      if (data is Map<String, dynamic>) {
+        throw Exception(data['error']?.toString() ?? 'Could not submit report');
+      }
+      throw Exception(_unexpectedServerResponseMessage());
+    } on TimeoutException {
+      throw Exception(
+        'The report could not be sent because the server timed out.',
+      );
+    } on http.ClientException {
+      throw Exception('Your device is offline or the server is unreachable.');
+    }
   }
 
   Future<Map<String, dynamic>> driverLogin(String phone, String pin) async {

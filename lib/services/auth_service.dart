@@ -3,6 +3,15 @@ import 'package:shared_preferences/shared_preferences.dart';
 import '../models/models.dart';
 import 'api_service.dart';
 
+String _normalizeCaretakerLoginEmail(String email) {
+  final normalizedEmail = email.trim().toLowerCase();
+  final match = RegExp(
+    r'^caretaker[-_](gh1|gh2|bh1|bh2|bh3|bh4)(?:@nitmz\.ac\.in)?$',
+  ).firstMatch(normalizedEmail);
+  if (match == null) return email.trim();
+  return 'caretaker-${match.group(1)}@nitmz.ac.in';
+}
+
 class AuthService extends ChangeNotifier {
   UserModel? _currentUser;
   bool _isLoading = false;
@@ -137,7 +146,7 @@ class AuthService extends ChangeNotifier {
     notifyListeners();
 
     try {
-      final data = await api.login(email, password);
+      final data = await api.login(_normalizeCaretakerLoginEmail(email), password);
       final userJson = data['user'] as Map<String, dynamic>;
       userJson['token'] = data['token'];
       _currentUser = UserModel.fromJson(userJson);
