@@ -25,3 +25,8 @@ Thumbs.db
 # Keep lib/ directory for source code!
 
 .env.local
+
+# Environment secrets
+.env
+.env.*
+!.env.example
