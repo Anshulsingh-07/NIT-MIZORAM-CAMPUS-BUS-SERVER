@@ -57,8 +57,8 @@ class _ForgotPasswordScreenState extends State<ForgotPasswordScreen> {
     final destination = _method == _RecoveryMethod.email
         ? _emailController.text.trim()
         : _mobileController.text.trim();
-    if (_method == _RecoveryMethod.email &&
-        !RegExp(r'^[^\s@]+@[^\s@]+\.[^\s@]+$').hasMatch(destination)) {
+    final email = _emailController.text.trim();
+    if (!RegExp(r'^[^\s@]+@[^\s@]+\.[^\s@]+$').hasMatch(email)) {
       setState(() => _errorMessage = 'Enter a valid college email address.');
       return;
     }
@@ -80,6 +80,7 @@ class _ForgotPasswordScreenState extends State<ForgotPasswordScreen> {
       await context.read<ApiService>().requestPasswordRecovery(
         method: _method == _RecoveryMethod.email ? 'email' : 'mobile',
         destination: destination,
+        accountEmail: _method == _RecoveryMethod.mobile ? email : null,
       );
       if (!mounted) return;
       if (_method == _RecoveryMethod.email) {
@@ -122,6 +123,7 @@ class _ForgotPasswordScreenState extends State<ForgotPasswordScreen> {
     });
     try {
       await context.read<ApiService>().resendPasswordResetOtp(
+        _emailController.text.trim(),
         _mobileController.text.trim(),
       );
       if (mounted) _startOtpCountdown();
@@ -149,6 +151,7 @@ class _ForgotPasswordScreenState extends State<ForgotPasswordScreen> {
     });
     try {
       _resetToken = await context.read<ApiService>().verifyPasswordResetOtp(
+        _emailController.text.trim(),
         _mobileController.text.trim(),
         _otpController.text.trim(),
       );
@@ -230,6 +233,7 @@ class _ForgotPasswordScreenState extends State<ForgotPasswordScreen> {
       appBar: AppBar(
         title: const Text('Password recovery'),
         backgroundColor: const Color(0xFFF4F7FB),
+        foregroundColor: const Color(0xFF172B44),
       ),
       body: SafeArea(
         child: Center(
@@ -337,29 +341,36 @@ class _ForgotPasswordScreenState extends State<ForgotPasswordScreen> {
         ),
         const SizedBox(height: 20),
         TextField(
-          controller: _method == _RecoveryMethod.email
-              ? _emailController
-              : _mobileController,
-          keyboardType: _method == _RecoveryMethod.email
-              ? TextInputType.emailAddress
-              : TextInputType.phone,
-          textInputAction: TextInputAction.done,
-          onSubmitted: (_) => _requestRecovery(),
+          controller: _emailController,
+          keyboardType: TextInputType.emailAddress,
+          textInputAction: _method == _RecoveryMethod.mobile
+              ? TextInputAction.next
+              : TextInputAction.done,
+          onSubmitted: _method == _RecoveryMethod.email
+              ? (_) => _requestRecovery()
+              : null,
           decoration: InputDecoration(
-            labelText: _method == _RecoveryMethod.email
-                ? 'Registered college email'
-                : 'Registered mobile number',
-            hintText: _method == _RecoveryMethod.email
-                ? 'name@nitmz.ac.in'
-                : '+91 98765 43210',
-            prefixIcon: Icon(
-              _method == _RecoveryMethod.email
-                  ? Icons.email_outlined
-                  : Icons.phone_iphone,
-            ),
+            labelText: 'Registered college email',
+            hintText: 'name@nitmz.ac.in',
+            prefixIcon: const Icon(Icons.email_outlined),
             border: OutlineInputBorder(borderRadius: BorderRadius.circular(14)),
           ),
         ),
+        if (_method == _RecoveryMethod.mobile) ...[
+          const SizedBox(height: 14),
+          TextField(
+            controller: _mobileController,
+            keyboardType: TextInputType.phone,
+            textInputAction: TextInputAction.done,
+            onSubmitted: (_) => _requestRecovery(),
+            decoration: InputDecoration(
+              labelText: 'Registered mobile number',
+              hintText: '+91 98765 43210',
+              prefixIcon: const Icon(Icons.phone_iphone),
+              border: OutlineInputBorder(borderRadius: BorderRadius.circular(14)),
+            ),
+          ),
+        ],
         if (_errorMessage != null) ...[
           const SizedBox(height: 14),
           _errorBanner(),

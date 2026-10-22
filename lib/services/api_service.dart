@@ -269,12 +269,17 @@ class ApiService {
   Future<String> requestPasswordRecovery({
     required String method,
     required String destination,
+    String? accountEmail,
   }) async {
     final normalizedMethod = method.trim().toLowerCase();
     final value = destination.trim();
     final payload = normalizedMethod == 'email'
         ? {'method': normalizedMethod, 'email': value.toLowerCase()}
-        : {'method': normalizedMethod, 'mobile': value};
+        : {
+            'method': normalizedMethod,
+            'email': accountEmail?.trim().toLowerCase() ?? '',
+            'mobile': value,
+          };
     final data = await _postRecoveryJson('/auth/forgot-password', payload);
     return data['message']?.toString() ??
         'If an account exists for these details, recovery instructions will be sent.';
@@ -283,16 +288,22 @@ class ApiService {
   Future<String> forgotPassword(String email) =>
       requestPasswordRecovery(method: 'email', destination: email);
 
-  Future<String> resendPasswordResetOtp(String mobile) async {
+  Future<String> resendPasswordResetOtp(String email, String mobile) async {
     final data = await _postRecoveryJson('/auth/resend-otp', {
+      'email': email.trim().toLowerCase(),
       'mobile': mobile.trim(),
     });
     return data['message']?.toString() ??
         'If an account exists for these details, recovery instructions will be sent.';
   }
 
-  Future<String> verifyPasswordResetOtp(String mobile, String otp) async {
+  Future<String> verifyPasswordResetOtp(
+    String email,
+    String mobile,
+    String otp,
+  ) async {
     final data = await _postRecoveryJson('/auth/verify-otp', {
+      'email': email.trim().toLowerCase(),
       'mobile': mobile.trim(),
       'otp': otp.trim(),
     });
@@ -645,11 +656,37 @@ class ApiService {
     throw Exception('Failed to load telemetry history');
   }
 
+  Future<String> requestRegistrationMobileOtp(String email, String mobile) async {
+    final data = await _postRecoveryJson('/auth/registration-mobile/request', {
+      'email': email.trim().toLowerCase(),
+      'mobile': mobile.trim(),
+    });
+    return data['message']?.toString() ?? 'Verification code sent.';
+  }
+
+  Future<String> verifyRegistrationMobileOtp(
+    String email,
+    String mobile,
+    String otp,
+  ) async {
+    final data = await _postRecoveryJson('/auth/registration-mobile/verify', {
+      'email': email.trim().toLowerCase(),
+      'mobile': mobile.trim(),
+      'otp': otp.trim(),
+    });
+    final token = data['verificationToken']?.toString();
+    if (token != null && token.isNotEmpty) return token;
+    throw Exception('The server returned an invalid verification response.');
+  }
+
   Future<Map<String, dynamic>> register(
     String name,
     String email,
+    String mobile,
     String password,
+    String confirmPassword,
     String hostelId,
+    String mobileVerificationToken,
   ) async {
     try {
       final response = await http
@@ -659,8 +696,11 @@ class ApiService {
             body: jsonEncode({
               'name': name,
               'email': email,
+              'mobile': mobile,
               'password': password,
+              'confirmPassword': confirmPassword,
               'hostelId': hostelId,
+              'mobileVerificationToken': mobileVerificationToken,
             }),
           )
           .timeout(const Duration(seconds: 10));

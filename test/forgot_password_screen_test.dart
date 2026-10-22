@@ -11,6 +11,9 @@ import 'package:provider/provider.dart';
 class _RecoveryApi extends ApiService {
   String? requestedMethod;
   String? requestedDestination;
+  String? requestedAccountEmail;
+  String? resentEmail;
+  String? verifiedEmail;
   String? verifiedMobile;
   String? verifiedOtp;
   String? resetToken;
@@ -23,21 +26,30 @@ class _RecoveryApi extends ApiService {
   Future<String> requestPasswordRecovery({
     required String method,
     required String destination,
+    String? accountEmail,
   }) async {
     recoveryRequestCount++;
     requestedMethod = method;
     requestedDestination = destination;
+    requestedAccountEmail = accountEmail;
     if (recoveryError != null) throw recoveryError!;
     if (recoveryCompleter != null) return recoveryCompleter!.future;
     return 'If an account exists, recovery instructions will be sent.';
   }
 
   @override
-  Future<String> resendPasswordResetOtp(String mobile) async =>
-      'Code requested';
+  Future<String> resendPasswordResetOtp(String email, String mobile) async {
+    resentEmail = email;
+    return 'Code requested';
+  }
 
   @override
-  Future<String> verifyPasswordResetOtp(String mobile, String otp) async {
+  Future<String> verifyPasswordResetOtp(
+    String email,
+    String mobile,
+    String otp,
+  ) async {
+    verifiedEmail = email;
     verifiedMobile = mobile;
     verifiedOtp = otp;
     return 'one-time-reset-token';
@@ -144,24 +156,32 @@ void main() {
   });
 
   test('defaults to the production SmartBus backend', () {
-    expect(ApiService.baseUrl, 'https://nitmz-bus-tracker.onrender.com/api');
-    expect(AppConfig.apiBaseUrl, 'https://nitmz-bus-tracker.onrender.com');
+    expect(
+      ApiService.baseUrl,
+      'http://127.0.0.1:8080/api',
+    );
+    expect(
+      AppConfig.apiBaseUrl,
+      'http://127.0.0.1:8080',
+    );
   });
 
   testWidgets('rejected request stays out of OTP verification', (tester) async {
     final api = _RecoveryApi()
-      ..recoveryError = Exception(
-        'Password recovery is not available on this server yet. Please try again later.',
-      );
+      ..recoveryError = Exception('Enter the registered email and mobile number.');
     await tester.pumpWidget(_buildTestApp(api));
     await tester.tap(find.text('Sign in'));
     await tester.pumpAndSettle();
-    await tester.enterText(find.byType(TextField).first, '9876543210');
+    await tester.enterText(
+      find.byType(TextField).at(0),
+      'caretaker-bh1@nitmz.ac.in',
+    );
+    await tester.enterText(find.byType(TextField).at(1), '9876543210');
     await tester.tap(find.text('Send code'));
     await tester.pump();
 
     expect(
-      find.textContaining('not available on this server yet'),
+      find.textContaining('registered email and mobile number'),
       findsOneWidget,
     );
     expect(find.text('Verify your number'), findsNothing);
@@ -198,7 +218,11 @@ void main() {
     await tester.pumpWidget(_buildTestApp(api));
     await tester.tap(find.text('Sign in'));
     await tester.pumpAndSettle();
-    await tester.enterText(find.byType(TextField).first, '9876543210');
+    await tester.enterText(
+      find.byType(TextField).at(0),
+      'caretaker-bh1@nitmz.ac.in',
+    );
+    await tester.enterText(find.byType(TextField).at(1), '9876543210');
     await tester.tap(find.text('Send code'));
     await tester.pump();
     await tester.tap(find.byType(FilledButton).first, warnIfMissed: false);
@@ -222,7 +246,11 @@ void main() {
       await tester.pumpWidget(_buildTestApp(api));
       await tester.tap(find.text('Sign in'));
       await tester.pumpAndSettle();
-      await tester.enterText(find.byType(TextField).first, '9876543210');
+      await tester.enterText(
+        find.byType(TextField).at(0),
+        'caretaker-bh1@nitmz.ac.in',
+      );
+      await tester.enterText(find.byType(TextField).at(1), '9876543210');
       await tester.tap(find.text('Send code'));
       await tester.pump();
 
@@ -245,7 +273,11 @@ void main() {
     await tester.tap(find.text('Sign in'));
     await tester.pumpAndSettle();
 
-    await tester.enterText(find.byType(TextField).first, '9876543210');
+    await tester.enterText(
+      find.byType(TextField).at(0),
+      'caretaker-bh1@nitmz.ac.in',
+    );
+    await tester.enterText(find.byType(TextField).at(1), '9876543210');
     await tester.tap(find.text('Send code'));
     await tester.pump();
     await tester.pump(const Duration(milliseconds: 250));
@@ -256,6 +288,7 @@ void main() {
     await tester.pump();
     await tester.pump(const Duration(milliseconds: 250));
     expect(api.verifiedMobile, '9876543210');
+    expect(api.verifiedEmail, 'caretaker-bh1@nitmz.ac.in');
     expect(api.verifiedOtp, '123456');
     expect(find.text('Create a new password'), findsOneWidget);
 

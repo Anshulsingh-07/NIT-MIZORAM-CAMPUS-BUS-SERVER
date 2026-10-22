@@ -209,8 +209,11 @@ class AuthService extends ChangeNotifier {
   Future<bool> register(
     String name,
     String email,
+    String mobile,
     String password,
+    String confirmPassword,
     String hostelId,
+    String mobileVerificationToken,
     ApiService api,
   ) async {
     _isLoading = true;
@@ -218,7 +221,15 @@ class AuthService extends ChangeNotifier {
     notifyListeners();
 
     try {
-      final data = await api.register(name, email, password, hostelId);
+      final data = await api.register(
+        name,
+        email,
+        mobile,
+        password,
+        confirmPassword,
+        hostelId,
+        mobileVerificationToken,
+      );
       final userJson = data['user'] as Map<String, dynamic>;
       userJson['token'] = data['token'];
       _currentUser = UserModel.fromJson(userJson);

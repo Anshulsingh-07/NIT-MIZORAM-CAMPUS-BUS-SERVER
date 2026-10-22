@@ -1,7 +1,6 @@
 import 'dart:async';
 
 import 'package:campus_bus_tracker/services/api_service.dart';
-import 'package:campus_bus_tracker/services/auth_service.dart';
 import 'package:campus_bus_tracker/screens/student/map_screen.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
