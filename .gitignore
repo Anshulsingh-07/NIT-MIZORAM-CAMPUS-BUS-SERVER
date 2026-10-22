@@ -39,3 +39,4 @@ Thumbs.db
 # Private credentials
 *.pem
 *.key
+.env
